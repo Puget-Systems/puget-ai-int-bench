@@ -31,13 +31,21 @@ done
 if [ "$ENDPOINT" == "ollama" ]; then
     URL="http://localhost:11434/v1"
     if [ -z "$MODEL_NAME" ]; then
-        MODEL_NAME="llama3" # Default for testing, should be overridden
+        # Dynamically fetch the first available model from Ollama
+        MODEL_NAME=$(curl -s http://localhost:11434/api/tags | grep -o '"name":"[^"]*' | head -n 1 | cut -d'"' -f4)
+        if [ -z "$MODEL_NAME" ]; then
+            MODEL_NAME="llama3" # Fallback
+        fi
     fi
     echo "Configuring for Personal LLM (Ollama) at $URL"
 elif [ "$ENDPOINT" == "vllm" ]; then
     URL="http://localhost:8000/v1"
     if [ -z "$MODEL_NAME" ]; then
-        MODEL_NAME="Qwen/Qwen1.5-7B-Chat" # Default for testing, should be overridden
+        # Dynamically fetch the first available model from vLLM
+        MODEL_NAME=$(curl -s http://localhost:8000/v1/models | grep -o '"id":"[^"]*' | head -n 1 | cut -d'"' -f4)
+        if [ -z "$MODEL_NAME" ]; then
+            MODEL_NAME="Qwen/Qwen1.5-7B-Chat" # Fallback
+        fi
     fi
     echo "Configuring for Team LLM (vLLM) at $URL"
 else
@@ -63,11 +71,12 @@ for CONC in "${CONC_ARRAY[@]}"; do
     
     # We use the Triton SDK container which includes genai-perf
     # --net=host allows the container to reach localhost endpoints on the host machine
+    # Note: Added 'profile' subcommand required by newer genai-perf versions
     docker run --rm --net=host \
         -v "$(pwd)/$RESULTS_DIR:/work/results" \
         -w /work \
         nvcr.io/nvidia/tritonserver:24.08-py3-sdk \
-        genai-perf \
+        genai-perf profile \
         -m "$MODEL_NAME" \
         --endpoint-type chat \
         --service-kind openai \
