@@ -66,7 +66,7 @@ for CONC in "${CONC_ARRAY[@]}"; do
     docker run --rm --net=host \
         -v "$(pwd)/$RESULTS_DIR:/work/results" \
         -w /work \
-        nvcr.io/nvidia/tritonserver:24.05-py3-sdk \
+        nvcr.io/nvidia/tritonserver:24.08-py3-sdk \
         genai-perf \
         -m "$MODEL_NAME" \
         --endpoint-type chat \
@@ -76,6 +76,7 @@ for CONC in "${CONC_ARRAY[@]}"; do
         --synthetic-input-tokens-mean "$INPUT_TOKENS" \
         --output-tokens-mean "$OUTPUT_TOKENS" \
         --concurrency "$CONC" \
+        --artifact-dir "results/artifacts_c${CONC}" \
         --profile-export-file "results/profile_c${CONC}.json"
         
     echo "Finished Concurrency $CONC"
