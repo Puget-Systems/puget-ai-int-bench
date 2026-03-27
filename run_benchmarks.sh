@@ -232,6 +232,18 @@ if [ "$LOCAL_MODE" = false ]; then
 fi
 
 # ============================================
+# 4. Generate Summary Report
+# ============================================
+echo ""
+echo "Generating summary report..."
+SUMMARY_SCRIPT="$SCRIPT_DIR/llm_tests/generate_summary.py"
+if [ -f "$SUMMARY_SCRIPT" ]; then
+    python3 "$SUMMARY_SCRIPT" "$LOCAL_RESULTS_DIR" "$SPEC_FILE" || echo "⚠️  Summary generation failed (python3 required)"
+else
+    echo "⚠️  Summary script not found at $SUMMARY_SCRIPT"
+fi
+
+# ============================================
 # Done
 # ============================================
 echo ""
