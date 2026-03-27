@@ -73,6 +73,7 @@ for CONC in "${CONC_ARRAY[@]}"; do
     # --net=host allows the container to reach localhost endpoints on the host machine
     # Note: Added 'profile' subcommand required by newer genai-perf versions
     docker run --rm --net=host \
+        -e NVIDIA_DISABLE_REQUIRE=1 \
         -v "$(pwd)/$RESULTS_DIR:/work/results" \
         -w /work \
         nvcr.io/nvidia/tritonserver:24.08-py3-sdk \
@@ -86,7 +87,7 @@ for CONC in "${CONC_ARRAY[@]}"; do
         --output-tokens-mean "$OUTPUT_TOKENS" \
         --concurrency "$CONC" \
         --artifact-dir "results/concurrency_${CONC}" \
-        --profile-export-file "results/concurrency_${CONC}/profile_export.json"
+        --profile-export-file "profile_export.json"
         
     echo "Finished Concurrency $CONC"
 done
