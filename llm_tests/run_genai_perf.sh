@@ -29,7 +29,7 @@ done
 
 # Configure target based on endpoint type
 if [ "$ENDPOINT" == "ollama" ]; then
-    URL="http://localhost:11434/v1"
+    URL="http://localhost:11434"
     if [ -z "$MODEL_NAME" ]; then
         # Dynamically fetch the first available model from Ollama
         MODEL_NAME=$(curl -s http://localhost:11434/api/tags | grep -o '"name":"[^"]*' | head -n 1 | cut -d'"' -f4)
@@ -39,7 +39,7 @@ if [ "$ENDPOINT" == "ollama" ]; then
     fi
     echo "Configuring for Personal LLM (Ollama) at $URL"
 elif [ "$ENDPOINT" == "vllm" ]; then
-    URL="http://localhost:8000/v1"
+    URL="http://localhost:8000"
     if [ -z "$MODEL_NAME" ]; then
         # Dynamically fetch the first available model from vLLM
         MODEL_NAME=$(curl -s http://localhost:8000/v1/models | grep -o '"id":"[^"]*' | head -n 1 | cut -d'"' -f4)
