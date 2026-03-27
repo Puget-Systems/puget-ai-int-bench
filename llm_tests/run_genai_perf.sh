@@ -66,6 +66,9 @@ if [ -z "$RESULTS_DIR" ]; then
 fi
 mkdir -p "$RESULTS_DIR"
 
+# Resolve to absolute path for Docker volume mount
+RESULTS_DIR="$(cd "$RESULTS_DIR" && pwd)"
+
 echo "=============================================="
 echo "Starting genai-perf benchmark"
 echo "Target: $ENDPOINT ($URL)"
@@ -84,7 +87,7 @@ for CONC in "${CONC_ARRAY[@]}"; do
     # --net=host allows the container to reach localhost endpoints on the host machine
     docker run --rm --net=host \
         -e NVIDIA_DISABLE_REQUIRE=1 \
-        -v "$(pwd)/$RESULTS_DIR:/work/results" \
+        -v "$RESULTS_DIR:/work/results" \
         -w /work \
         nvcr.io/nvidia/tritonserver:24.08-py3-sdk \
         genai-perf profile \
