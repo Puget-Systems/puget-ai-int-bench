@@ -2,6 +2,7 @@
 
 # Puget Systems AI App Packs - genai-perf Benchmarking Script
 # This script uses the NVIDIA Triton SDK container to run genai-perf against OpenAI-compatible endpoints.
+# It can be run directly on the inference server (by the orchestrator or standalone).
 
 set -e
 
@@ -12,6 +13,7 @@ INPUT_TOKENS=500
 OUTPUT_TOKENS=500
 NUM_PROMPTS=50
 MODEL_NAME=""
+RESULTS_DIR=""
 
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
@@ -22,6 +24,7 @@ while [[ "$#" -gt 0 ]]; do
         --input-tokens) INPUT_TOKENS="$2"; shift ;;
         --output-tokens) OUTPUT_TOKENS="$2"; shift ;;
         --num-prompts) NUM_PROMPTS="$2"; shift ;;
+        --results-dir) RESULTS_DIR="$2"; shift ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift
@@ -31,7 +34,6 @@ done
 if [ "$ENDPOINT" == "ollama" ]; then
     URL="http://localhost:11434"
     if [ -z "$MODEL_NAME" ]; then
-        # Dynamically fetch the first available model from Ollama
         MODEL_NAME=$(curl -s http://localhost:11434/api/tags | grep -o '"name":"[^"]*' | head -n 1 | cut -d'"' -f4)
         if [ -z "$MODEL_NAME" ]; then
             MODEL_NAME="llama3" # Fallback
@@ -41,7 +43,6 @@ if [ "$ENDPOINT" == "ollama" ]; then
 elif [ "$ENDPOINT" == "vllm" ]; then
     URL="http://localhost:8000"
     if [ -z "$MODEL_NAME" ]; then
-        # Dynamically fetch the first available model from vLLM
         MODEL_NAME=$(curl -s http://localhost:8000/v1/models | grep -o '"id":"[^"]*' | head -n 1 | cut -d'"' -f4)
         if [ -z "$MODEL_NAME" ]; then
             MODEL_NAME="Qwen/Qwen1.5-7B-Chat" # Fallback
@@ -53,7 +54,10 @@ else
     exit 1
 fi
 
-RESULTS_DIR="../results/genai_perf_${ENDPOINT}_$(date +%Y%m%d_%H%M%S)"
+# Set up results directory
+if [ -z "$RESULTS_DIR" ]; then
+    RESULTS_DIR="results/genai_perf_${ENDPOINT}_$(date +%Y%m%d_%H%M%S)"
+fi
 mkdir -p "$RESULTS_DIR"
 
 echo "=============================================="
@@ -62,6 +66,7 @@ echo "Target: $ENDPOINT ($URL)"
 echo "Model: $MODEL_NAME"
 echo "Input Tokens: $INPUT_TOKENS | Output Tokens: $OUTPUT_TOKENS"
 echo "Concurrency Levels: $CONCURRENCY_LIST"
+echo "Results: $RESULTS_DIR"
 echo "=============================================="
 
 # Loop through concurrency levels
@@ -71,7 +76,6 @@ for CONC in "${CONC_ARRAY[@]}"; do
     
     # We use the Triton SDK container which includes genai-perf
     # --net=host allows the container to reach localhost endpoints on the host machine
-    # Note: Added 'profile' subcommand required by newer genai-perf versions
     docker run --rm --net=host \
         -e NVIDIA_DISABLE_REQUIRE=1 \
         -v "$(pwd)/$RESULTS_DIR:/work/results" \
