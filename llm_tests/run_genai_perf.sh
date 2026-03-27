@@ -86,8 +86,7 @@ for CONC in "${CONC_ARRAY[@]}"; do
         --synthetic-input-tokens-mean "$INPUT_TOKENS" \
         --output-tokens-mean "$OUTPUT_TOKENS" \
         --concurrency "$CONC" \
-        --artifact-dir "results/concurrency_${CONC}" \
-        --profile-export-file "profile_export.json"
+        --artifact-dir "results/concurrency_${CONC}"
         
     echo "Finished Concurrency $CONC"
 done
