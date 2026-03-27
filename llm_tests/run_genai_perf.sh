@@ -86,7 +86,10 @@ for CONC in "${CONC_ARRAY[@]}"; do
         --synthetic-input-tokens-mean "$INPUT_TOKENS" \
         --output-tokens-mean "$OUTPUT_TOKENS" \
         --concurrency "$CONC" \
-        --artifact-dir "results/concurrency_${CONC}"
+        --artifact-dir "results/concurrency_${CONC}" \
+        -- \
+        --measurement-interval 120000 \
+        --stability-percentage 999
         
     echo "Finished Concurrency $CONC"
 done
