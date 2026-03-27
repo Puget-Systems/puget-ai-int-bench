@@ -14,12 +14,14 @@ OUTPUT_TOKENS=500
 NUM_PROMPTS=50
 MODEL_NAME=""
 RESULTS_DIR=""
+URL=""
 
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --endpoint) ENDPOINT="$2"; shift ;;
         --model) MODEL_NAME="$2"; shift ;;
+        --url) URL="$2"; shift ;;
         --concurrency) CONCURRENCY_LIST="$2"; shift ;;
         --input-tokens) INPUT_TOKENS="$2"; shift ;;
         --output-tokens) OUTPUT_TOKENS="$2"; shift ;;
@@ -32,18 +34,22 @@ done
 
 # Configure target based on endpoint type
 if [ "$ENDPOINT" == "ollama" ]; then
-    URL="http://localhost:11434"
+    # Use provided URL or default to localhost
+    URL="${URL:-http://localhost:11434}"
     if [ -z "$MODEL_NAME" ]; then
-        MODEL_NAME=$(curl -s http://localhost:11434/api/tags | grep -o '"name":"[^"]*' | head -n 1 | cut -d'"' -f4)
+        # Try to discover model (works when running on same machine as Ollama)
+        MODEL_NAME=$(curl -s --connect-timeout 2 "${URL}/api/tags" 2>/dev/null | grep -o '"name":"[^"]*' | head -n 1 | cut -d'"' -f4 || echo "")
         if [ -z "$MODEL_NAME" ]; then
             MODEL_NAME="llama3" # Fallback
         fi
     fi
     echo "Configuring for Personal LLM (Ollama) at $URL"
 elif [ "$ENDPOINT" == "vllm" ]; then
-    URL="http://localhost:8000"
+    # Use provided URL or default to localhost
+    URL="${URL:-http://localhost:8000}"
     if [ -z "$MODEL_NAME" ]; then
-        MODEL_NAME=$(curl -s http://localhost:8000/v1/models | grep -o '"id":"[^"]*' | head -n 1 | cut -d'"' -f4)
+        # Try to discover model (works when running on same machine as vLLM)
+        MODEL_NAME=$(curl -s --connect-timeout 2 "${URL}/v1/models" 2>/dev/null | grep -o '"id":"[^"]*' | head -n 1 | cut -d'"' -f4 || echo "")
         if [ -z "$MODEL_NAME" ]; then
             MODEL_NAME="Qwen/Qwen1.5-7B-Chat" # Fallback
         fi
