@@ -1,0 +1,36 @@
+=============================================
+System Specifications — ubuntu
+=============================================
+Date: Fri Mar 27 14:40:08 PDT 2026
+
+Hostname: ubuntu
+
+Virtualization:
+  Type: Virtual Machine (kvm)
+
+CPU Information:
+Architecture:                            x86_64
+CPU(s):                                  16
+On-line CPU(s) list:                     0-15
+Model name:                              QEMU Virtual CPU version 2.5+
+Thread(s) per core:                      1
+Core(s) per socket:                      1
+Socket(s):                               16
+NUMA node0 CPU(s):                       0-15
+
+Memory Information:
+               total        used        free      shared  buff/cache   available
+Mem:            62Gi       9.7Gi       657Mi       129Mi        53Gi        53Gi
+Swap:             0B          0B          0B
+
+GPU Information:
+index, name, memory.total [MiB], driver_version
+0, NVIDIA GeForce RTX 5090, 32607 MiB, 580.126.09
+1, NVIDIA GeForce RTX 5090, 32607 MiB, 580.126.09
+
+OS Information:
+PRETTY_NAME="Ubuntu 24.04.4 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+VERSION="24.04.4 LTS (Noble Numbat)"
+VERSION_CODENAME=noble

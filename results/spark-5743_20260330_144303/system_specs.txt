@@ -1,0 +1,42 @@
+=============================================
+System Specifications — spark-5743
+=============================================
+Date: Mon Mar 30 14:43:03 PDT 2026
+
+Hostname: spark-5743
+
+Virtualization:
+  Type: Virtual Machine (none
+unknown)
+
+CPU Information:
+Architecture:                         aarch64
+CPU(s):                               20
+On-line CPU(s) list:                  0-19
+Model name:                           Cortex-X925
+Thread(s) per core:                   1
+Core(s) per socket:                   10
+Socket(s):                            1
+CPU(s) scaling MHz:                   91%
+Model name:                           Cortex-A725
+Thread(s) per core:                   1
+Core(s) per socket:                   10
+Socket(s):                            1
+CPU(s) scaling MHz:                   84%
+NUMA node0 CPU(s):                    0-19
+
+Memory Information:
+               total        used        free      shared  buff/cache   available
+Mem:           121Gi       121Gi       1.2Gi        70Mi       486Mi       629Mi
+Swap:           15Gi       3.1Gi        12Gi
+
+GPU Information:
+index, name, memory.total [MiB], driver_version
+0, NVIDIA GB10, [N/A], 580.95.05
+
+OS Information:
+PRETTY_NAME="Ubuntu 24.04.3 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+VERSION="24.04.3 LTS (Noble Numbat)"
+VERSION_CODENAME=noble

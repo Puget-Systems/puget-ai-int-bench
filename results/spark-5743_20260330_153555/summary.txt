@@ -1,0 +1,52 @@
+Benchmark Summary
+==================================================
+
+System Specs:
+=============================================
+System Specifications — spark-5743
+=============================================
+Date: Mon Mar 30 15:35:55 PDT 2026
+
+Hostname: spark-5743
+
+Virtualization:
+  Type: Virtual Machine (none
+unknown)
+
+CPU Information:
+Architecture:                         aarch64
+CPU(s):                               20
+On-line CPU(s) list:                  0-19
+Model name:                           Cortex-X925
+Thread(s) per core:                   1
+Core(s) per socket:                   10
+Socket(s):                            1
+CPU(s) scaling MHz:                   93%
+Model name:                           Cortex-A725
+Thread(s) per core:                   1
+Core(s) per socket:                   10
+Socket(s):                            1
+CPU(s) scaling MHz:                   92%
+NUMA node0 CPU(s):                    0-19
+
+Memory Information:
+               total        used        free      shared  buff/cache   available
+Mem:           121Gi       3.5Gi        89Gi       308Ki        29Gi       118Gi
+Swap:           15Gi       346Mi        15Gi
+
+GPU Information:
+index, name, memory.total [MiB], driver_version
+0, NVIDIA GB10, [N/A], 580.95.05
+
+OS Information:
+PRETTY_NAME="Ubuntu 24.04.3 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+VERSION="24.04.3 LTS (Noble Numbat)"
+VERSION_CODENAME=noble
+
+
+Results:
+   Concurrency |     Throughput |      Req/s |    Avg Latency |    P99 Latency |   TTFT (avg)
+  -------------+----------------+------------+----------------+----------------+-------------
+             1 |     38.4 tok/s |       0.13 |           7.9s |          27.2s |         7.9s
