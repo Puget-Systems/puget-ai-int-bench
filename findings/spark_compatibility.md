@@ -91,7 +91,36 @@ the hard-fail check. Already implemented in `run_genai_perf.sh`.
 
 ---
 
-### 4. Ollama ARM64 Compatibility
+### 4. Ollama Silent CPU Fallback (All Platforms — Critical)
+
+**Problem:** If the NVIDIA Container Toolkit loses GPU context (e.g., after a VM
+sleep/resume cycle, driver update, or system hibernation), Ollama **silently falls
+back to CPU-only inference** with no user-facing error.
+
+**Symptom:** Generation feels "slow" — ~5-10 tok/s instead of 100+ tok/s. The only
+indicator is deep in the container logs:
+
+```
+ggml_cuda_init: failed to initialize CUDA: no CUDA-capable device is detected
+offloading 0 repeating layers to GPU
+offloaded 0/53 layers to GPU
+```
+
+**Impact:** Critical for customer experience. Users will think the hardware is slow
+rather than diagnosing a container GPU passthrough issue.
+
+**Fix:** Restart the container stack to re-establish CUDA device injection:
+```bash
+cd ~/personal_llm && docker compose down && docker compose up -d
+```
+
+**Recommendation for App Pack:** Add a GPU health check probe to the compose file
+or `init.sh` that verifies `nvidia-smi` works inside the container on startup and
+warns the user if GPU acceleration is unavailable.
+
+---
+
+### 5. Ollama ARM64 Compatibility
 
 **Status:** ✅ Works out of the box.
 
