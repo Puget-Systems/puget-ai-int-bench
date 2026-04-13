@@ -1,0 +1,14 @@
+# Puget Systems AI App Pack — Benchmark Configuration
+# Copy this to ~/.config/puget-bench/bench.conf to persist defaults.
+#
+# All values are optional — command-line flags override config file values.
+
+# Squid cache proxy on DGX Spark for faster model downloads
+# (Deployed via puget-hypervisor-devops/terraform — docker_cache_proxy module)
+CACHE_PROXY=http://172.19.168.179:3128
+
+# Git branch of puget-docker-app-pack to clone (default: main)
+# APP_PACK_BRANCH=main
+
+# Default concurrency levels for vLLM benchmarks
+# CONCURRENCY=1,4,8,16

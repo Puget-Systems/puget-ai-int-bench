@@ -1,26 +1,66 @@
 #!/bin/bash
 
-# Puget Systems AI Internal Benchmarks Orchestrator
+# Puget Systems AI App Pack — Automated Benchmark Suite
 #
-# Architecture: SSH into the inference server for specs + service detection,
-# then run the benchmark Docker container LOCALLY on this machine, pointed
-# at the remote server's IP. This avoids resource contention on the inference server.
+# End-to-end benchmark orchestrator that targets a remote inference server
+# to download, install, launch, benchmark, and tear down App Packs automatically.
+# Benchmarking client (genai-perf) runs locally.
 #
 # Usage:
-#   ./run_benchmarks.sh --host puget@172.19.168.179
-#   ./run_benchmarks.sh --host puget@172.19.168.179 --concurrency "1,4,8,16"
-#   ./run_benchmarks.sh --local
+#   ./run_benchmarks.sh --host USER@IP                     # Interactive mode targeting a remote server
+#   ./run_benchmarks.sh --host USER@IP --cache-proxy URL   # With cache proxy
+#   ./run_benchmarks.sh --host USER@IP --pack team_llm --model 1
+#   ./run_benchmarks.sh --host USER@IP --run-all
 
-set -e
+set -euo pipefail
+
+# ============================================
+# ANSI Color Codes
+# ============================================
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# ============================================
+# Constants
+# ============================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_PACK_REPO="https://github.com/Puget-Systems/puget-docker-app-packs.git"
+APP_PACK_BRANCH="main"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/puget-bench"
+CONFIG_FILE="$CONFIG_DIR/bench.conf"
 
 # ============================================
 # Defaults
 # ============================================
 HOST=""
-LOCAL_MODE=false
+CACHE_PROXY=""
+PACK=""
+MODEL_CHOICE=""
+RUN_ALL=false
+DRY_RUN=false
 CONCURRENCY="1,4,8,16"
 SSH_KEY=""
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INPUT_TOKENS=500
+OUTPUT_TOKENS=500
+NUM_PROMPTS=50
+
+# ============================================
+# Load Config File (if exists)
+# ============================================
+if [ -f "$CONFIG_FILE" ]; then
+    # Validate config contains only comments, blank lines, and KEY=VALUE
+    if grep -qvE '^\s*$|^\s*#|^[A-Z_][A-Z0-9_]*=' "$CONFIG_FILE"; then
+        echo -e "${RED}✗ Config file contains unexpected content: $CONFIG_FILE${NC}"
+        echo "  Only KEY=VALUE assignments, comments (#), and blank lines are allowed."
+        exit 1
+    fi
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
 
 # ============================================
 # Parse Arguments
@@ -28,229 +68,632 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --host) HOST="$2"; shift ;;
-        --local) LOCAL_MODE=true ;;
+        --cache-proxy) CACHE_PROXY="$2"; shift ;;
+        --pack) PACK="$2"; shift ;;
+        --model) MODEL_CHOICE="$2"; shift ;;
+        --run-all) RUN_ALL=true ;;
+        --dry-run) DRY_RUN=true ;;
         --concurrency) CONCURRENCY="$2"; shift ;;
+        --repo) APP_PACK_REPO="$2"; shift ;;
+        --branch) APP_PACK_BRANCH="$2"; shift ;;
+        --input-tokens) INPUT_TOKENS="$2"; shift ;;
+        --output-tokens) OUTPUT_TOKENS="$2"; shift ;;
+        --num-prompts) NUM_PROMPTS="$2"; shift ;;
         --ssh-key) SSH_KEY="$2"; shift ;;
         -h|--help)
-            echo "Puget Systems AI App Pack Benchmarking Suite"
+            echo -e "${BLUE}Puget Systems AI App Pack — Automated Benchmark Suite${NC}"
             echo ""
             echo "Usage:"
-            echo "  ./run_benchmarks.sh --host USER@IP     Benchmark a remote inference server"
-            echo "  ./run_benchmarks.sh --local            Benchmark this machine"
+            echo "  ./run_benchmarks.sh --host USER@IP                   Interactive mode on remote server"
+            echo "  ./run_benchmarks.sh --host USER@IP --run-all         Run full test matrix on remote server"
             echo ""
             echo "Options:"
-            echo "  --host USER@IP       SSH target for spec collection (e.g., puget@172.19.168.179)"
-            echo "                       Benchmarks run locally, pointed at the remote server"
-            echo "  --local              Run everything on the current machine"
+            echo "  --host USER@IP       (Required) SSH target for server-side operations"
+            echo "  --cache-proxy URL    Squid cache proxy (e.g., http://172.19.168.179:3128)"
+            echo "  --pack NAME          App Pack: team_llm, personal_llm"
+            echo "  --model CHOICE       Model menu number (1-9) or model ID string"
+            echo "  --run-all            Run all VRAM-appropriate models automatically"
+            echo "  --dry-run            Validate setup without launching containers"
             echo "  --concurrency LIST   Concurrency levels (default: 1,4,8,16)"
-            echo "  --ssh-key PATH       Path to SSH private key (optional)"
-            echo "  -h, --help           Show this help message"
+            echo "  --repo URL           App Pack git repository URL or local path"
+            echo "  --branch NAME        App Pack git branch (default: main)"
+            echo "  --ssh-key PATH       Path to SSH private key"
             exit 0
             ;;
-        *) echo "Unknown parameter: $1. Use --help for usage."; exit 1 ;;
+        *) echo -e "${RED}Unknown parameter: $1. Use --help for usage.${NC}"; exit 1 ;;
     esac
     shift
 done
 
-# Validate arguments
-if [ "$LOCAL_MODE" = false ] && [ -z "$HOST" ]; then
-    echo "❌ Error: You must specify either --host USER@IP or --local."
-    echo "   Run with --help for usage information."
+if [ -z "$HOST" ]; then
+    echo -e "${RED}✗ Error: --host USER@IP is required.${NC}"
+    echo "  The orchestrator runs on your local machine and uses SSH to manage App Packs on the inference server."
     exit 1
-fi
-
-# ============================================
-# SSH Helpers
-# ============================================
-SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
-if [ -n "$SSH_KEY" ]; then
-    SSH_OPTS="$SSH_OPTS -i $SSH_KEY"
 fi
 
 # Extract IP/hostname from USER@IP format
-if [ -n "$HOST" ]; then
-    REMOTE_IP="${HOST#*@}"
+REMOTE_IP="${HOST#*@}"
+BENCH_URL_BASE="http://${REMOTE_IP}"
+
+# ============================================
+# Command Execution Helpers
+# ============================================
+declare -a SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
+if [ -n "$SSH_KEY" ]; then
+    SSH_OPTS+=(-i "$SSH_KEY")
 fi
 
-# Run a command on the inference server (SSH) or locally
-remote_cmd() {
-    if [ "$LOCAL_MODE" = true ]; then
-        eval "$@"
-    else
-        ssh $SSH_OPTS "$HOST" "$@"
-    fi
+target_cmd() {
+    ssh "${SSH_OPTS[@]}" "$HOST" "$@"
 }
 
-# ============================================
-# Banner
-# ============================================
-echo "=============================================="
-echo "Puget Systems AI App Pack Benchmarking Suite"
-echo "=============================================="
+run_genai_perf_client() {
+    local endpoint="$1"
+    local url="$2"
+    local model="$3"
+    local concurrency="$4"
+    local results_dir="$5"
+    
+    echo -e "  ${BLUE}Running genai-perf benchmark locally pointed at ${url}...${NC}"
+    
+    (
+        cd "$SCRIPT_DIR/llm_tests"
+        ./run_genai_perf.sh \
+            --endpoint "$endpoint" \
+            --url "$url" \
+            --model "$model" \
+            --concurrency "$concurrency" \
+            --input-tokens "$INPUT_TOKENS" \
+            --output-tokens "$OUTPUT_TOKENS" \
+            --num-prompts "$NUM_PROMPTS" \
+            --results-dir "$results_dir"
+    )
+}
 
-if [ "$LOCAL_MODE" = true ]; then
-    echo "Mode: Local (benchmarking this machine)"
-    BENCH_URL_BASE="http://localhost"
+echo -e "${BLUE}==============================================================${NC}"
+echo -e "${BLUE}   Puget Systems AI App Pack — Automated Benchmark Suite${NC}"
+echo -e "${BLUE}==============================================================${NC}"
+echo ""
+
+# Test SSH connection
+echo -e "${YELLOW}[0/6] Testing SSH connection to $HOST...${NC}"
+if ! target_cmd "echo 'SSH connection successful'" >/dev/null; then
+    echo -e "${RED}✗ SSH connection failed. Make sure you have key-based auth set up:${NC}"
+    echo "   ssh-copy-id $HOST"
+    exit 1
+fi
+echo -e "${GREEN}✓ Connected to $HOST.${NC}"
+
+if [ "$DRY_RUN" = true ]; then
+    echo ""
+    echo -e "${YELLOW}⚠  DRY RUN MODE — no containers will be launched${NC}"
+    echo ""
+fi
+
+# ============================================
+# 0.5. Remote Preflight — Docker & NVIDIA Provisioning
+# ============================================
+# Check if Docker and nvidia-smi are both available remotely
+NEED_PREFLIGHT=false
+if ! target_cmd "command -v docker > /dev/null 2>&1"; then
+    echo ""
+    echo -e "${YELLOW}[0.5/6] Docker not found on remote server — running preflight provisioning...${NC}"
+    echo -e "${YELLOW}  This will install Docker CE, NVIDIA drivers, and Container Toolkit.${NC}"
+    NEED_PREFLIGHT=true
+elif ! target_cmd "command -v nvidia-smi > /dev/null 2>&1"; then
+    echo ""
+    echo -e "${YELLOW}[0.5/6] NVIDIA drivers not found on remote server — running preflight...${NC}"
+    NEED_PREFLIGHT=true
 else
-    echo "Mode: Remote (inference server: $HOST)"
-    echo "  Specs collected via SSH from $HOST"
-    echo "  Benchmark runs locally, pointed at $REMOTE_IP"
-    BENCH_URL_BASE="http://${REMOTE_IP}"
+    echo -e "${GREEN}✓ Docker and NVIDIA drivers detected on remote server.${NC}"
+fi
 
-    # Test SSH connectivity
-    echo "Testing SSH connection..."
-    if ! remote_cmd "echo 'SSH connection successful'"; then
-        echo "❌ SSH connection failed. Make sure you have key-based auth set up:"
-        echo "   ssh-copy-id $HOST"
+if [ "$NEED_PREFLIGHT" = true ]; then
+    echo ""
+
+    PREFLIGHT_SCRIPT="$SCRIPT_DIR/scripts/remote_preflight.sh"
+    if [ ! -f "$PREFLIGHT_SCRIPT" ]; then
+        echo -e "${RED}✗ Preflight script not found at $PREFLIGHT_SCRIPT${NC}"
         exit 1
     fi
-fi
 
-# ============================================
-# Determine remote hostname for result naming
-# ============================================
-if [ "$LOCAL_MODE" = true ]; then
-    TARGET_HOSTNAME=$(hostname -s 2>/dev/null || hostname)
-else
-    TARGET_HOSTNAME=$(remote_cmd "hostname -s 2>/dev/null || hostname")
-fi
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-
-# Local results directory
-LOCAL_RESULTS_DIR="$SCRIPT_DIR/results/${TARGET_HOSTNAME}_${TIMESTAMP}"
-mkdir -p "$LOCAL_RESULTS_DIR"
-
-# ============================================
-# 1. Collect System Specifications (via SSH)
-# ============================================
-echo ""
-echo "Collecting System Specifications from ${TARGET_HOSTNAME}..."
-SPEC_FILE="$LOCAL_RESULTS_DIR/system_specs.txt"
-
-echo "=============================================" > "$SPEC_FILE"
-echo "System Specifications — $TARGET_HOSTNAME" >> "$SPEC_FILE"
-echo "=============================================" >> "$SPEC_FILE"
-echo "Date: $(date)" >> "$SPEC_FILE"
-echo "" >> "$SPEC_FILE"
-
-# Hostname
-echo "Hostname: $TARGET_HOSTNAME" >> "$SPEC_FILE"
-echo "" >> "$SPEC_FILE"
-
-# Virtualization Detection
-echo "Virtualization:" >> "$SPEC_FILE"
-VIRT_TYPE=$(remote_cmd "systemd-detect-virt 2>/dev/null || echo 'unknown'")
-if [ "$VIRT_TYPE" = "none" ] || [ "$VIRT_TYPE" = "unknown" ]; then
-    echo "  Type: Bare Metal" >> "$SPEC_FILE"
-else
-    echo "  Type: Virtual Machine ($VIRT_TYPE)" >> "$SPEC_FILE"
-fi
-echo "" >> "$SPEC_FILE"
-
-# CPU
-echo "CPU Information:" >> "$SPEC_FILE"
-remote_cmd "lscpu | grep -E 'Model name|Architecture|CPU\(s\)|Thread|Core|Socket'" >> "$SPEC_FILE" 2>/dev/null || echo "  lscpu not available" >> "$SPEC_FILE"
-echo "" >> "$SPEC_FILE"
-
-# Memory
-echo "Memory Information:" >> "$SPEC_FILE"
-remote_cmd "free -h" >> "$SPEC_FILE" 2>/dev/null || echo "  free not available" >> "$SPEC_FILE"
-echo "" >> "$SPEC_FILE"
-
-# GPU
-echo "GPU Information:" >> "$SPEC_FILE"
-GPU_INFO=$(remote_cmd "nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv" 2>/dev/null || echo "")
-if [ -n "$GPU_INFO" ]; then
-    echo "$GPU_INFO" >> "$SPEC_FILE"
-else
-    echo "  nvidia-smi not found. No NVIDIA GPUs detected." >> "$SPEC_FILE"
-fi
-echo "" >> "$SPEC_FILE"
-
-# OS
-echo "OS Information:" >> "$SPEC_FILE"
-remote_cmd "cat /etc/os-release 2>/dev/null | head -5" >> "$SPEC_FILE" || echo "  OS info not available" >> "$SPEC_FILE"
-
-echo "✅ Saved specs to $SPEC_FILE"
-
-# ============================================
-# 2. Detect Active App Packs & Run Benchmarks
-# ============================================
-echo ""
-echo "Detecting Active App Packs on ${TARGET_HOSTNAME}..."
-
-FOUND_PACKS=false
-
-# Check for Personal LLM (Ollama) — detect via SSH, bench locally
-if remote_cmd "curl -s --connect-timeout 2 http://localhost:11434/api/tags" > /dev/null 2>&1; then
-    echo "✅ Detected Personal LLM (Ollama) on port 11434!"
-    FOUND_PACKS=true
-
-    # Discover model name from the remote server
-    OLLAMA_MODEL=$(remote_cmd "curl -s http://localhost:11434/api/tags | grep -o '\"name\":\"[^\"]*' | head -n 1 | cut -d'\"' -f4" 2>/dev/null || echo "")
-
-    echo "Starting genai-perf for Ollama (benchmark runs locally)..."
-    cd "$SCRIPT_DIR/llm_tests"
-    chmod +x run_genai_perf.sh
-    ./run_genai_perf.sh \
-        --endpoint ollama \
-        --url "${BENCH_URL_BASE}:11434" \
-        --concurrency "1" \
-        --results-dir "$LOCAL_RESULTS_DIR" \
-        ${OLLAMA_MODEL:+--model "$OLLAMA_MODEL"}
-    cd - > /dev/null
-else
-    echo "❌ Personal LLM (Ollama) not detected on port 11434."
-fi
-
-# Check for Team LLM (vLLM) — detect via SSH, bench locally
-if remote_cmd "curl -s --connect-timeout 2 http://localhost:8000/v1/models" > /dev/null 2>&1; then
-    echo "✅ Detected Team LLM (vLLM) on port 8000!"
-    FOUND_PACKS=true
-
-    # Discover model name from the remote server
-    VLLM_MODEL=$(remote_cmd "curl -s http://localhost:8000/v1/models | grep -o '\"id\":\"[^\"]*' | head -n 1 | cut -d'\"' -f4" 2>/dev/null || echo "")
-
-    echo "Starting genai-perf for vLLM (benchmark runs locally)..."
-    cd "$SCRIPT_DIR/llm_tests"
-    chmod +x run_genai_perf.sh
-    ./run_genai_perf.sh \
-        --endpoint vllm \
-        --url "${BENCH_URL_BASE}:8000" \
-        --concurrency "$CONCURRENCY" \
-        --results-dir "$LOCAL_RESULTS_DIR" \
-        ${VLLM_MODEL:+--model "$VLLM_MODEL"}
-    cd - > /dev/null
-else
-    echo "❌ Team LLM (vLLM) not detected on port 8000."
-fi
-
-if [ "$FOUND_PACKS" = false ]; then
+    # Ask for sudo password locally (only once)
+    read -s -p "  Enter sudo password for remote server ($HOST): " REMOTE_SUDO_PASS
     echo ""
-    echo "⚠️  No active App Packs detected. Make sure vLLM or Ollama is running."
+
+    # Pass the password via heredoc stdin to avoid exposure in ps output
+    run_preflight() {
+        ssh "${SSH_OPTS[@]}" "$HOST" "bash -s" <<PREFLIGHT_STDIN
+export SUDO_PASS='$(printf '%s' "$REMOTE_SUDO_PASS" | sed "s/'/'\\\\''/g")'
+$(cat "$PREFLIGHT_SCRIPT")
+PREFLIGHT_STDIN
+    }
+
+    # Helper to reboot and wait for server to come back
+    reboot_and_wait() {
+        echo ""
+        echo -e "${YELLOW}NVIDIA drivers were installed. Rebooting remote server...${NC}"
+        ssh "${SSH_OPTS[@]}" "$HOST" "sudo -S reboot" <<< "$REMOTE_SUDO_PASS" 2>/dev/null || true
+
+        echo -e "${YELLOW}  Waiting for server to go down...${NC}"
+        sleep 10
+
+        echo -e "${YELLOW}  Waiting for server to come back (up to 3 minutes)...${NC}"
+        local timeout=180 elapsed=0
+        while [ $elapsed -lt $timeout ]; do
+            if target_cmd "echo 'back'" >/dev/null 2>&1; then
+                echo -e "${GREEN}✓ Server is back online.${NC}"
+                return 0
+            fi
+            sleep 5
+            elapsed=$((elapsed + 5))
+        done
+
+        echo -e "${RED}✗ Server did not come back after reboot within ${timeout}s.${NC}"
+        echo "  Check the server console and try again."
+        return 1
+    }
+
+    PREFLIGHT_EXIT=0
+    run_preflight || PREFLIGHT_EXIT=$?
+
+    if [ "$PREFLIGHT_EXIT" -eq 100 ]; then
+        reboot_and_wait || exit 1
+
+        # Wait for services to stabilize
+        sleep 5
+
+        # Re-run preflight to verify everything and configure Docker runtime
+        echo ""
+        echo -e "${YELLOW}  Re-running preflight to verify post-reboot state...${NC}"
+        PREFLIGHT_EXIT=0
+        run_preflight || PREFLIGHT_EXIT=$?
+
+        if [ "$PREFLIGHT_EXIT" -ne 0 ]; then
+            echo -e "${RED}✗ Post-reboot preflight verification failed (exit $PREFLIGHT_EXIT).${NC}"
+            exit 1
+        fi
+    elif [ "$PREFLIGHT_EXIT" -ne 0 ]; then
+        echo -e "${RED}✗ Remote preflight failed (exit $PREFLIGHT_EXIT). Cannot continue.${NC}"
+        exit 1
+    fi
+
+    # Clear the sudo password from memory
+    unset REMOTE_SUDO_PASS
+
+    echo ""
+    echo -e "${GREEN}✓ Remote server provisioned and ready.${NC}"
+fi
+
+
+
+# ============================================
+# 1. Acquire App Pack Repository (Remote)
+# ============================================
+echo ""
+echo -e "${YELLOW}[1/6] Acquiring App Pack repository on remote server...${NC}"
+
+REMOTE_TEMP_DIR=$(target_cmd "mktemp -d")
+cleanup() {
+    echo ""
+    echo -e "${DIM}Cleaning up remote temp directory...${NC}"
+    target_cmd "rm -rf $REMOTE_TEMP_DIR" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+if [[ "$APP_PACK_REPO" == http* || "$APP_PACK_REPO" == git@* ]]; then
+    echo -e "  Cloning ${BLUE}${APP_PACK_REPO}${NC} (branch: ${GREEN}${APP_PACK_BRANCH}${NC})..."
+    # Ensure git is installed remotely
+    if ! target_cmd "command -v git >/dev/null"; then
+        echo -e "${RED}✗ git is not installed on the remote server.${NC}"
+        exit 1
+    fi
+    if ! target_cmd "git clone --depth 1 --branch \"$APP_PACK_BRANCH\" \"$APP_PACK_REPO\" \"$REMOTE_TEMP_DIR/app-pack\" 2>&1 | tail -1"; then
+        echo -e "${RED}✗ Failed to clone App Pack repository on remote server.${NC}"
+        exit 1
+    fi
+elif [ -d "$APP_PACK_REPO" ]; then
+    echo -e "  Syncing local repository ${BLUE}${APP_PACK_REPO}${NC} to remote server..."
+    if ! rsync -a -e "ssh ${SSH_OPTS[*]}" --exclude=".git" "$APP_PACK_REPO/" "$HOST:$REMOTE_TEMP_DIR/app-pack/"; then
+        echo -e "${RED}✗ Failed to rsync local repository to remote server.${NC}"
+        exit 1
+    fi
+else
+    echo -e "${RED}✗ APP_PACK_REPO is not a valid URL or local directory: ${APP_PACK_REPO}${NC}"
     exit 1
 fi
 
+echo -e "${GREEN}✓ Repository deployed to $REMOTE_TEMP_DIR/app-pack.${NC}"
+
+PACK_ROOT="$REMOTE_TEMP_DIR/app-pack"
+
 # ============================================
-# 3. Generate Summary Report
+# 2. Integrity Check (MD5) - Remote
 # ============================================
 echo ""
-echo "Generating summary report..."
-SUMMARY_SCRIPT="$SCRIPT_DIR/llm_tests/generate_summary.py"
-if [ -f "$SUMMARY_SCRIPT" ]; then
-    python3 "$SUMMARY_SCRIPT" "$LOCAL_RESULTS_DIR" "$SPEC_FILE" || echo "⚠️  Summary generation failed (python3 required)"
+echo -e "${YELLOW}[2/6] Verifying installer integrity on remote server...${NC}"
+
+CHECKSUM_FILE="$PACK_ROOT/install.sh.md5"
+if target_cmd "[ -f \"$CHECKSUM_FILE\" ]"; then
+    EXPECTED_HASH=$(target_cmd "awk '{print \$1}' \"$CHECKSUM_FILE\"")
+    # Determine hashing tool
+    if target_cmd "command -v md5sum >/dev/null"; then
+        ACTUAL_HASH=$(target_cmd "md5sum \"$PACK_ROOT/install.sh\" | awk '{print \$1}'")
+    elif target_cmd "command -v md5 >/dev/null"; then
+        ACTUAL_HASH=$(target_cmd "md5 -q \"$PACK_ROOT/install.sh\"")
+    else
+        echo -e "${YELLOW}⚠ No md5 tool found on remote server — skipping integrity check.${NC}"
+        ACTUAL_HASH="$EXPECTED_HASH"
+    fi
+
+    if [ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]; then
+        echo -e "${RED}✗ Integrity check FAILED.${NC}"
+        echo -e "  Expected MD5: ${EXPECTED_HASH}"
+        echo -e "  Got MD5:      ${ACTUAL_HASH}"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ Installer integrity verified (MD5).${NC}"
 else
-    echo "⚠️  Summary script not found at $SUMMARY_SCRIPT"
+    echo -e "${YELLOW}⚠ No checksum file found — skipping integrity check.${NC}"
 fi
 
 # ============================================
-# Done
+# 3. Detect Hardware (Remote via helper script)
 # ============================================
 echo ""
-echo "=============================================="
-echo "Benchmarks Complete!"
-echo "Results saved to: $LOCAL_RESULTS_DIR"
-echo "=============================================="
+echo -e "${YELLOW}[3/6] Detecting hardware on remote server...${NC}"
+
+# We execute a small inline script remotely that sources gpu_detect.sh and prints key variables back to us
+GPU_INFO=$(target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\" && if detect_gpus; then echo \"OK|\$GPU_COUNT|\$TOTAL_VRAM|\$GPU_NAME|\$IS_BLACKWELL|\$COMPUTE_CAP\"; else echo \"FAIL\"; fi'")
+
+if [[ "$GPU_INFO" == "FAIL" || -z "$GPU_INFO" ]]; then
+    echo -e "${RED}✗ nvidia-smi not found or failed on remote server. GPU benchmarks require NVIDIA drivers.${NC}"
+    exit 1
+fi
+
+IFS='|' read -r status GPU_COUNT TOTAL_VRAM GPU_NAME IS_BLACKWELL COMPUTE_CAP <<< "$GPU_INFO"
+
+echo -e "${GREEN}✓ Found ${GPU_COUNT}x ${GPU_NAME} (${TOTAL_VRAM} GB total)${NC}"
+if [ "$IS_BLACKWELL" = "true" ]; then
+    echo -e "${GREEN}  Blackwell GPU detected (compute ${COMPUTE_CAP}) → using CUDA 13.0 paths${NC}"
+fi
+
+if [ -n "$CACHE_PROXY" ]; then
+    echo -e "${GREEN}✓ Cache Proxy: ${CACHE_PROXY}${NC}"
+fi
+
+# System Specs Collection
+TARGET_HOSTNAME=$(target_cmd "hostname -s 2>/dev/null || hostname")
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+MASTER_RESULTS_DIR="$SCRIPT_DIR/results/${TARGET_HOSTNAME}_${TIMESTAMP}"
+mkdir -p "$MASTER_RESULTS_DIR"
+
+SPEC_FILE="$MASTER_RESULTS_DIR/system_specs.txt"
+source "$SCRIPT_DIR/scripts/collect_specs.sh"
+collect_system_specs "target_cmd" "$SPEC_FILE" "$TARGET_HOSTNAME"
+
+echo -e "${GREEN}✓ System specs saved to $SPEC_FILE.${NC}"
+
+# ============================================
+# 4. Build Test Matrix
+# ============================================
 echo ""
-echo "Contents:"
-ls -la "$LOCAL_RESULTS_DIR"
+echo -e "${YELLOW}[4/6] Configuring test matrix...${NC}"
+
+declare -a TEST_MATRIX=()
+
+# Local functions to abstract the config generation that normally happens inside install.sh
+# We can't interactively prompt the user from a remote bash session easily, so we parse options locally.
+get_vllm_model_info() {
+    local choice="$1"
+    # Execute vllm_model_select.sh functions remotely and capture variables
+    local remote_out
+    remote_out=$(target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\"; detect_gpus >/dev/null; source \"$PACK_ROOT/scripts/lib/vllm_model_select.sh\"; if select_vllm_model \"$choice\" >/dev/null 2>&1; then echo \"OK|\$VLLM_MODEL_ID|\$VLLM_IMAGE|\$VLLM_GPU_COUNT|\$VLLM_GPU_MEM_UTIL|\$VLLM_DTYPE|\$VLLM_MAX_CTX|\$VLLM_REASONING_ARGS\"; else echo \"FAIL\"; fi'")
+    
+    if [[ "$remote_out" == FAIL* || -z "$remote_out" ]]; then
+        return 1
+    fi
+    echo "$remote_out"
+    return 0
+}
+
+define_run_all_matrix() {
+    # Team LLM models (vLLM)
+    TEST_MATRIX+=("team_llm|1|Qwen3-8B|16||1")
+    if [ "$TOTAL_VRAM" -ge 40 ]; then
+        TEST_MATRIX+=("team_llm|2|Qwen3-32B-FP8|40||$CONCURRENCY")
+    fi
+
+    # Personal LLM models (Ollama)
+    TEST_MATRIX+=("personal_llm|0|qwen3:8b|8|qwen3:8b|1")
+    if [ "$TOTAL_VRAM" -ge 32 ]; then
+        TEST_MATRIX+=("personal_llm|0|qwen3:32b|32|qwen3:32b|1")
+    fi
+}
+
+show_ollama_model_menu() {
+    echo "  1) Qwen 3 (8B)           - Fast, Low VRAM (~5 GB)"
+    echo "  2) Qwen 3 (32B)          - Best Quality, Single GPU (~20 GB)"
+    if [ "$TOTAL_VRAM" -ge 40 ]; then
+        echo "  3) DeepSeek R1 (70B)     - Flagship Reasoning, Dual GPU (~42 GB)"
+    else
+        echo -e "  3) DeepSeek R1 (70B)     - ${RED}Requires ~42 GB VRAM${NC}"
+    fi
+    echo "  4) Nemotron 3 Nano (30B) - NVIDIA MoE Reasoning (~24 GB)"
+    if [ "$TOTAL_VRAM" -ge 80 ]; then
+        echo "  5) Nemotron 3 Super      - NVIDIA Flagship MoE (~96 GB)"
+    else
+        echo -e "  5) Nemotron 3 Super      - ${RED}Requires ~96 GB VRAM${NC}"
+    fi
+    echo "  6) Custom tag            - Enter an Ollama model tag"
+}
+
+select_ollama_model() {
+    local choice="$1"
+    OLLAMA_MODEL_TAG=""
+    case $choice in
+        1) OLLAMA_MODEL_TAG="qwen3:8b" ;;
+        2) OLLAMA_MODEL_TAG="qwen3:32b" ;;
+        3) OLLAMA_MODEL_TAG="deepseek-r1:70b" ;;
+        4) OLLAMA_MODEL_TAG="nemotron-3-nano:30b" ;;
+        5) OLLAMA_MODEL_TAG="nemotron-3-super" ;;
+        6)
+            read -p "  Enter Ollama model tag: " OLLAMA_MODEL_TAG
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+# Fetch vllm menu output from remote 
+show_vllm_menu_remote() {
+    target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\" >/dev/null 2>&1; detect_gpus >/dev/null 2>&1; source \"$PACK_ROOT/scripts/lib/vllm_model_select.sh\" >/dev/null 2>&1; show_vllm_model_menu'"
+}
+
+if [ "$RUN_ALL" = true ]; then
+    echo -e "  Mode: ${GREEN}Run ALL${NC} (automatic VRAM-gated matrix)"
+    define_run_all_matrix
+    echo ""
+    echo "  Test matrix (${#TEST_MATRIX[@]} benchmarks):"
+    for entry in "${TEST_MATRIX[@]}"; do
+        IFS='|' read -r e_pack e_choice e_name e_vram e_tag e_conc <<< "$entry"
+        echo -e "    • ${GREEN}${e_pack}${NC} → ${e_name}"
+    done
+elif [ -n "$PACK" ]; then
+    echo -e "  Mode: ${GREEN}Non-interactive${NC} (--pack ${PACK}, --model ${MODEL_CHOICE})"
+    
+    if [ "$PACK" = "team_llm" ]; then
+        if [ -z "$MODEL_CHOICE" ]; then
+            echo -e "${RED}✗ --model is required with --pack team_llm${NC}"
+            exit 1
+        fi
+        TEST_MATRIX+=("team_llm|${MODEL_CHOICE}|${MODEL_CHOICE}|0||${CONCURRENCY}")
+        
+    elif [ "$PACK" = "personal_llm" ]; then
+        if [ -z "$MODEL_CHOICE" ]; then
+            echo -e "${RED}✗ --model is required with --pack personal_llm${NC}"
+            exit 1
+        fi
+        if [[ "$MODEL_CHOICE" =~ ^[0-9]+$ ]]; then
+            select_ollama_model "$MODEL_CHOICE"
+            TEST_MATRIX+=("personal_llm|${MODEL_CHOICE}|${OLLAMA_MODEL_TAG}|0|${OLLAMA_MODEL_TAG}|1")
+        else
+            TEST_MATRIX+=("personal_llm|0|${MODEL_CHOICE}|0|${MODEL_CHOICE}|1")
+        fi
+    else
+        echo -e "${RED}✗ Unknown pack: ${PACK}.${NC}"; exit 1
+    fi
+else
+    # Interactive Flow on local Mac
+    echo -e "  Mode: ${GREEN}Interactive${NC}"
+    echo ""
+    echo "  Select an App Pack to benchmark:"
+    echo "    1) Team LLM (vLLM)       — Production inference"
+    echo "    2) Personal LLM (Ollama) — Single-user inference"
+    echo "    3) Run ALL               — Full test matrix"
+    echo ""
+    read -p "  Select [1-3]: " PACK_CHOICE
+
+    case $PACK_CHOICE in
+        1)
+            PACK="team_llm"
+            echo ""
+            echo "  Select a model for vLLM:"
+            echo ""
+            show_vllm_menu_remote
+            echo ""
+            read -p "  Select [1-9]: " MODEL_CHOICE
+            if [[ "$MODEL_CHOICE" =~ ^[89]$ ]]; then
+                if [ "$MODEL_CHOICE" = "8" ]; then
+                    read -p "  Enter HuggingFace model ID: " CUSTOM_MODEL
+                    TEST_MATRIX+=("team_llm|custom|${CUSTOM_MODEL}|0||${CONCURRENCY}")
+                else
+                    echo "Exiting."; exit 0
+                fi
+            else
+                TEST_MATRIX+=("team_llm|${MODEL_CHOICE}|Menu_Choice_${MODEL_CHOICE}|0||${CONCURRENCY}")
+            fi
+            ;;
+        2)
+            PACK="personal_llm"
+            echo ""
+            echo "  Select a model for Ollama:"
+            echo ""
+            show_ollama_model_menu
+            echo ""
+            read -p "  Select [1-6]: " MODEL_CHOICE
+            if select_ollama_model "$MODEL_CHOICE"; then
+                TEST_MATRIX+=("personal_llm|${MODEL_CHOICE}|${OLLAMA_MODEL_TAG}|0|${OLLAMA_MODEL_TAG}|1")
+            else
+                echo -e "${RED}✗ Invalid selection.${NC}"; exit 1
+            fi
+            ;;
+        3)
+            RUN_ALL=true
+            define_run_all_matrix
+            ;;
+        *) echo -e "${RED}Invalid selection.${NC}"; exit 1 ;;
+    esac
+fi
+
+if [ "$DRY_RUN" = true ]; then
+    echo ""
+    echo -e "${GREEN}==============================================================${NC}"
+    echo -e "${GREEN}  DRY RUN COMPLETE — validation passed${NC}"
+    echo -e "${GREEN}==============================================================${NC}"
+    echo "  Target Host:     $HOST"
+    echo "  App Pack repo:   ✓ Cloned and verified to $REMOTE_TEMP_DIR"
+    echo "  GPU detection:   ✓ ${GPU_COUNT}x ${GPU_NAME} (${TOTAL_VRAM} GB)"
+    echo "  Cache proxy:     ${CACHE_PROXY:-not configured}"
+    echo "  Test matrix:     ${#TEST_MATRIX[@]} benchmark(s)"
+    echo "  Results dir:     $MASTER_RESULTS_DIR"
+    rm -rf "$MASTER_RESULTS_DIR"
+    exit 0
+fi
+
+# ============================================
+# 5. Execute Benchmarks
+# ============================================
+echo ""
+# Ensure run_genai_perf.sh is executable once
+chmod +x "$SCRIPT_DIR/llm_tests/run_genai_perf.sh"
+
+echo -e "${YELLOW}[5/6] Running benchmarks...${NC}"
+echo ""
+
+BENCH_COUNT=0
+BENCH_TOTAL=${#TEST_MATRIX[@]}
+FAILED_BENCHMARKS=()
+
+for entry in "${TEST_MATRIX[@]}"; do
+    IFS='|' read -r BENCH_PACK BENCH_CHOICE BENCH_MODEL BENCH_MIN_VRAM BENCH_OLLAMA_TAG BENCH_CONCURRENCY <<< "$entry"
+    BENCH_COUNT=$((BENCH_COUNT + 1))
+
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BLUE}  Benchmark ${BENCH_COUNT}/${BENCH_TOTAL}: ${BENCH_PACK} → ${BENCH_MODEL}${NC}"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+
+    SAFE_MODEL_NAME=$(echo "$BENCH_MODEL" | tr '/:' '_')
+    BENCH_RESULTS_DIR="$MASTER_RESULTS_DIR/${BENCH_PACK}_${SAFE_MODEL_NAME}"
+    mkdir -p "$BENCH_RESULTS_DIR"
+
+    WORK_DIR="$REMOTE_TEMP_DIR/bench_${BENCH_PACK}_${SAFE_MODEL_NAME}"
+    target_cmd "cp -r \"$PACK_ROOT/packs/$BENCH_PACK\" \"$WORK_DIR\""
+    target_cmd "mkdir -p \"$WORK_DIR/scripts/lib\" && cp \"$PACK_ROOT/scripts/lib/\"*.sh \"$WORK_DIR/scripts/lib/\""
+
+    if [ "$BENCH_PACK" = "team_llm" ]; then
+        if [[ "$BENCH_CHOICE" == "custom" || ! "$BENCH_CHOICE" =~ ^[0-9]+$ ]]; then
+            # Custom model
+            target_cmd "cat > \"$WORK_DIR/.env\"" <<ENVEOF
+MODEL_ID=${BENCH_MODEL}
+VLLM_IMAGE=latest
+GPU_COUNT=${GPU_COUNT}
+GPU_MEMORY_UTILIZATION=0.90
+DTYPE=auto
+REASONING_ARGS=
+TOOL_CALL_ARGS=
+EXTRA_VLLM_ARGS=
+MAX_CONTEXT=
+CACHE_PROXY=${CACHE_PROXY}
+ENVEOF
+        else
+            vllm_info=$(get_vllm_model_info "$BENCH_CHOICE") || { echo -e "${RED}✗ Required ${BENCH_MIN_VRAM}GB VRAM for choice $BENCH_CHOICE. Skip.${NC}"; continue; }
+            IFS='|' read -r status m_id m_img m_gpus m_mem m_dtype m_ctx m_reason <<< "$vllm_info"
+            BENCH_MODEL="$m_id" # update to true ID
+            target_cmd "cat > \"$WORK_DIR/.env\"" <<ENVEOF
+MODEL_ID=${m_id}
+VLLM_IMAGE=${m_img}
+GPU_COUNT=${m_gpus}
+GPU_MEMORY_UTILIZATION=${m_mem}
+DTYPE=${m_dtype}
+MAX_CONTEXT=${m_ctx}
+REASONING_ARGS=${m_reason}
+CACHE_PROXY=${CACHE_PROXY}
+ENVEOF
+        fi
+
+        echo -e "  ${BLUE}Starting vLLM on remote server...${NC}"
+        target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null; docker compose up -d"
+        echo ""
+
+        echo -e "  ${YELLOW}Waiting for model to load by invoking vllm_monitor remotely...${NC}"
+        target_cmd "bash -c 'source \"$WORK_DIR/scripts/lib/vllm_monitor.sh\" && wait_for_vllm \"puget_vllm\" \"0\"'"
+
+        if ! target_cmd "curl -s --max-time 5 http://localhost:8000/v1/models > /dev/null 2>&1"; then
+            echo -e "  ${RED}✗ vLLM API not responding. Skipping.${NC}"
+            target_cmd "cd \"$WORK_DIR\" && docker compose logs --tail 20"
+            target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null"
+            FAILED_BENCHMARKS+=("$BENCH_MODEL (vLLM failed)")
+            continue
+        fi
+
+        API_MODEL=$(target_cmd "curl -s http://localhost:8000/v1/models 2>/dev/null | grep -o '\"id\":\"[^\"]*' | head -n 1 | cut -d'\"' -f4" || echo "$BENCH_MODEL")
+
+        echo ""
+        if ! run_genai_perf_client "vllm" "${BENCH_URL_BASE}:8000" "$API_MODEL" "$BENCH_CONCURRENCY" "$BENCH_RESULTS_DIR"; then
+            echo -e "  ${RED}✗ genai-perf failed for ${BENCH_MODEL}${NC}"
+            FAILED_BENCHMARKS+=("${BENCH_MODEL} (genai-perf failed)")
+        fi
+
+        target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null"
+
+    elif [ "$BENCH_PACK" = "personal_llm" ]; then
+        target_cmd "cat > \"$WORK_DIR/.env\"" <<ENVEOF
+PUGET_APP_NAME=puget-bench-ollama
+CACHE_PROXY=${CACHE_PROXY}
+ENVEOF
+
+        echo -e "  ${BLUE}Starting Ollama on remote server...${NC}"
+        target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null; docker compose up -d"
+
+        echo -e "  ${YELLOW}Waiting for Ollama API...${NC}"
+        # Remote wait loop - ensure bash is used on remote for brace expansion
+        if ! target_cmd "bash -c 'for i in {1..60}; do curl -s --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'"; then
+             echo -e "  ${RED}✗ Ollama API not responding. Skipping.${NC}"
+             target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null"
+             FAILED_BENCHMARKS+=("$BENCH_OLLAMA_TAG (Ollama failed)")
+             continue
+        fi
+
+        echo -e "  ${BLUE}Pulling remote model: ${BENCH_OLLAMA_TAG}...${NC}"
+        if ! target_cmd "docker exec puget_ollama ollama pull \"$BENCH_OLLAMA_TAG\""; then
+             echo -e "  ${RED}✗ Failed to pull remote model. Skipping.${NC}"
+             target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null"
+             FAILED_BENCHMARKS+=("$BENCH_OLLAMA_TAG (pull failed)")
+             continue
+        fi
+
+        echo ""
+        if ! run_genai_perf_client "ollama" "${BENCH_URL_BASE}:11434" "$BENCH_OLLAMA_TAG" "$BENCH_CONCURRENCY" "$BENCH_RESULTS_DIR"; then
+             echo -e "  ${RED}✗ genai-perf failed for ${BENCH_OLLAMA_TAG}${NC}"
+             FAILED_BENCHMARKS+=("${BENCH_OLLAMA_TAG} (genai-perf failed)")
+        fi
+
+        target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null"
+    fi
+done
+
+# ============================================
+# 6. Generate Consolidated Report
+# ============================================
+echo -e "${YELLOW}[6/6] Generating consolidated report...${NC}"
+SUMMARY_SCRIPT="$SCRIPT_DIR/llm_tests/generate_summary.py"
+if [ -f "$SUMMARY_SCRIPT" ]; then
+    python3 "$SUMMARY_SCRIPT" "$MASTER_RESULTS_DIR" "$SPEC_FILE" || true
+fi
+
+echo ""
+echo -e "${GREEN}==============================================================${NC}"
+echo -e "${GREEN}  Benchmarks Complete!${NC}"
+echo -e "${GREEN}==============================================================${NC}"
+echo "  Results: $MASTER_RESULTS_DIR"
+
+if [ ${#FAILED_BENCHMARKS[@]} -gt 0 ]; then
+    echo ""
+    echo -e "${RED}The following benchmarks FAILED:${NC}"
+    for fail in "${FAILED_BENCHMARKS[@]}"; do
+        echo -e "  ${RED}• $fail${NC}"
+    done
+    echo ""
+fi
