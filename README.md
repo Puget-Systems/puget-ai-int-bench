@@ -32,7 +32,7 @@ cd puget-ai-int-bench
 ./run_benchmarks.sh --host USER@INFERENCE_SERVER_IP
 
 # With cache proxy for faster model downloads
-./run_benchmarks.sh --host USER@IP --cache-proxy http://172.19.168.179:3128
+./run_benchmarks.sh --host USER@IP --cache-proxy http://CACHE_PROXY_IP:3128
 ```
 
 The script will:
@@ -81,7 +81,7 @@ The script will:
 Persist defaults in `~/.config/puget-bench/bench.conf`:
 
 ```bash
-CACHE_PROXY=http://172.19.168.179:3128
+CACHE_PROXY=http://CACHE_PROXY_IP:3128
 APP_PACK_BRANCH=main
 CONCURRENCY=1,4,8,16
 ```

@@ -8,7 +8,7 @@
 # Called by run_benchmarks.sh when --host or --local is specified.
 #
 # Usage (via main script):
-#   ./run_benchmarks.sh --host puget@172.19.168.179
+#   ./run_benchmarks.sh --host USER@INFERENCE_SERVER_IP
 #   ./run_benchmarks.sh --local
 
 set -e

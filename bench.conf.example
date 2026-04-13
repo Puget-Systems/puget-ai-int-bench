@@ -5,7 +5,7 @@
 
 # Squid cache proxy on DGX Spark for faster model downloads
 # (Deployed via puget-hypervisor-devops/terraform — docker_cache_proxy module)
-CACHE_PROXY=http://172.19.168.179:3128
+CACHE_PROXY=http://CACHE_PROXY_IP:3128
 
 # Git branch of puget-docker-app-pack to clone (default: main)
 # APP_PACK_BRANCH=main

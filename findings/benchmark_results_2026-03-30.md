@@ -128,7 +128,7 @@ run models far too large for a single 5090 without multi-GPU complexity.
 ### 3. Docker on VM vs Bare Metal
 
 The 5090 tests were run inside a KVM VM with GPU passthrough. Phase 2 will run
-the same tests on the bare-metal hypervisor (dustin@172.19.69.192) after shutting
+the same tests on the bare-metal hypervisor (USER@HYPERVISOR_IP) after shutting
 down the VM to release the GPUs. This will isolate the VM overhead, which is
 expected to be small (<5%) based on prior PCI passthrough benchmarks.
 

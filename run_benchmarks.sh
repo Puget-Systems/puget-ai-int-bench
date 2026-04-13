@@ -89,7 +89,7 @@ while [[ "$#" -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --host USER@IP       (Required) SSH target for server-side operations"
-            echo "  --cache-proxy URL    Squid cache proxy (e.g., http://172.19.168.179:3128)"
+            echo "  --cache-proxy URL    Squid cache proxy for model downloads"
             echo "  --pack NAME          App Pack: team_llm, personal_llm"
             echo "  --model CHOICE       Model menu number (1-9) or model ID string"
             echo "  --run-all            Run all VRAM-appropriate models automatically"
