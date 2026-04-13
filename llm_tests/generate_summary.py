@@ -3,7 +3,12 @@
 Puget Systems Benchmark Summary Generator
 
 Parses genai-perf output files and generates a consolidated summary table.
+Supports multi-model/multi-pack benchmark runs with per-benchmark subdirectories.
 Works with both JSON and CSV genai-perf exports.
+
+Outputs:
+  - summary.txt  (terminal-friendly table)
+  - summary.md   (Markdown for findings/)
 """
 
 import json
@@ -11,25 +16,43 @@ import csv
 import os
 import sys
 from pathlib import Path
+from datetime import datetime
 
 
 def find_result_files(results_dir):
-    """Find all genai-perf result files, grouped by concurrency level."""
-    results = {}  # type: dict
+    """Find all genai-perf result files, grouped by (benchmark_name, concurrency).
+
+    Returns dict of:
+      { (bench_label, concurrency): Path }
+    """
+    results = {}
     results_path = Path(results_dir)
 
-    # Look for genai-perf JSON files in concurrency_* directories
-    for json_file in sorted(results_path.glob("**/profile_export_genai_perf.json")):
-        # Extract concurrency level from parent dir name (e.g., "concurrency_4")
+    # Strategy 1: Look in per-benchmark subdirectories (new automated mode)
+    # e.g., results/host_timestamp/team_llm_Qwen_Qwen3-8B/concurrency_1/
+    for subdir in sorted(results_path.iterdir()):
+        if subdir.is_dir() and subdir.name != "." and not subdir.name.startswith("."):
+            bench_label = subdir.name
+            for json_file in sorted(subdir.glob("**/profile_export_genai_perf.json")):
+                parent = json_file.parent.name
+                if parent.startswith("concurrency_"):
+                    try:
+                        conc = int(parent.split("_")[1])
+                        results[(bench_label, conc)] = json_file
+                    except (ValueError, IndexError):
+                        continue
+
+    # Strategy 2: Look in top-level concurrency_* dirs (legacy single-model mode)
+    for json_file in sorted(results_path.glob("concurrency_*/profile_export_genai_perf.json")):
         parent = json_file.parent.name
         if parent.startswith("concurrency_"):
             try:
                 conc = int(parent.split("_")[1])
-                results[conc] = json_file
+                results[("default", conc)] = json_file
             except (ValueError, IndexError):
                 continue
 
-    # Also check inside genai_perf_* subdirectories (from remote mode)
+    # Strategy 3: Inside genai_perf_* subdirectories (remote mode)
     for subdir in sorted(results_path.glob("genai_perf_*")):
         if subdir.is_dir():
             for json_file in sorted(subdir.glob("**/profile_export_genai_perf.json")):
@@ -37,7 +60,7 @@ def find_result_files(results_dir):
                 if parent.startswith("concurrency_"):
                     try:
                         conc = int(parent.split("_")[1])
-                        results[conc] = json_file
+                        results[(subdir.name, conc)] = json_file
                     except (ValueError, IndexError):
                         continue
 
@@ -51,11 +74,9 @@ def parse_json_results(json_path):
 
     metrics = {}
 
-    # Navigate the JSON structure — genai-perf stores metrics under different keys
-    # depending on version, so we try multiple paths
     request_metrics = data if isinstance(data, dict) else {}
 
-    # Try to find throughput metrics
+    # Throughput
     for key in ["output_token_throughput_per_request", "output_token_throughput"]:
         if key in request_metrics:
             val = request_metrics[key]
@@ -122,8 +143,8 @@ def parse_csv_results(csv_path):
                 elif "request latency" in metric_name.lower():
                     metrics["avg_latency_ms"] = float(row.get("avg", 0))
                     metrics["p99_latency_ms"] = float(row.get("p99", 0))
-    except Exception:
-        pass
+    except (IOError, ValueError, KeyError, csv.Error) as e:
+        print(f"  ⚠ CSV parse warning: {e}", file=sys.stderr)
     return metrics
 
 
@@ -144,6 +165,21 @@ def format_throughput(val):
         return f"{val:.2f}"
 
 
+def prettify_bench_label(label):
+    """Convert a directory name like 'team_llm_Qwen_Qwen3-8B' to a readable label."""
+    if label == "default":
+        return "—"
+    # Strip common pack prefixes for cleaner display
+    for prefix in ["team_llm_", "personal_llm_"]:
+        if label.startswith(prefix):
+            pack = "vLLM" if "team" in prefix else "Ollama"
+            model = label[len(prefix):].replace("_", "/", 1)
+            return f"{pack}: {model}"
+    return label
+
+
+
+
 def generate_summary(results_dir, system_specs_file=None):
     """Generate and print the benchmark summary."""
     result_files = find_result_files(results_dir)
@@ -153,16 +189,15 @@ def generate_summary(results_dir, system_specs_file=None):
         return
 
     # Parse all results
-    all_metrics = {}  # type: dict
-    for conc, json_path in result_files.items():
+    all_metrics = {}
+    for key, json_path in result_files.items():
         metrics = parse_json_results(json_path)
         if not metrics:
-            # Try CSV fallback
             csv_path = json_path.with_suffix("").with_suffix(".csv")
             if csv_path.exists():
                 metrics = parse_csv_results(csv_path)
         if metrics:
-            all_metrics[conc] = metrics
+            all_metrics[key] = metrics
 
     if not all_metrics:
         print("Could not parse any result files.")
@@ -174,44 +209,60 @@ def generate_summary(results_dir, system_specs_file=None):
         with open(system_specs_file) as f:
             system_info = f.read()
 
+    # Determine if this is a multi-benchmark run
+    bench_labels = sorted(set(k[0] for k in all_metrics.keys()))
+    is_multi = len(bench_labels) > 1 or bench_labels[0] != "default"
+
     # Determine which columns we have data for
     has_ttft = any("ttft_avg_ms" in m for m in all_metrics.values())
     has_itl = any("itl_avg_ms" in m for m in all_metrics.values())
 
-    # Print summary
-    separator = "=" * 72
-    print()
-    print(separator)
-    print("  BENCHMARK SUMMARY")
-    print(separator)
+    # ---- Build terminal output ----
+    separator = "=" * 78
+    lines = []  # Collect lines for both stdout and file
 
-    # Extract model name from system info or first result
+    lines.append("")
+    lines.append(separator)
+    lines.append("  BENCHMARK SUMMARY")
+    lines.append(separator)
+
+    # System info
+    host_name = ""
+    platform_type = ""
+    gpu_line = ""
     if system_info:
         for line in system_info.split("\n"):
             if "Hostname:" in line:
-                print(f"  Host: {line.split(':', 1)[1].strip()}")
+                host_name = line.split(":", 1)[1].strip()
+                lines.append(f"  Host: {host_name}")
             if "Type:" in line:
-                print(f"  Platform: {line.split(':', 1)[1].strip()}")
-
-    # GPU info
-    if system_info:
+                platform_type = line.split(":", 1)[1].strip()
+                lines.append(f"  Platform: {platform_type}")
         for line in system_info.split("\n"):
             if any(gpu in line.lower() for gpu in ["rtx", "tesla", "a100", "h100", "gb10", "geforce"]):
-                print(f"  GPU: {line.strip()}")
+                gpu_line = line.strip()
+                lines.append(f"  GPU: {gpu_line}")
                 break
 
-    print(separator)
-    print()
+    lines.append(f"  Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    lines.append(separator)
+    lines.append("")
 
-    # Build the table
-    # Header
-    cols = ["Concurrency", "Throughput", "Req/s", "Avg Latency", "P99 Latency"]
+    # ---- Build table ----
+    cols = []
+    if is_multi:
+        cols.append("Benchmark")
+    cols.extend(["Conc", "Throughput", "Req/s", "Avg Latency", "P99 Latency"])
     if has_ttft:
         cols.append("TTFT (avg)")
     if has_itl:
         cols.append("ITL (avg)")
 
-    widths = [12, 14, 10, 14, 14]
+    widths = []
+    if is_multi:
+        max_label_len = max(len(prettify_bench_label(l)) for l in bench_labels)
+        widths.append(max(max_label_len, 12))
+    widths.extend([6, 14, 10, 14, 14])
     if has_ttft:
         widths.append(12)
     if has_itl:
@@ -220,69 +271,123 @@ def generate_summary(results_dir, system_specs_file=None):
     header = " | ".join(f"{col:>{w}}" for col, w in zip(cols, widths))
     divider = "-+-".join("-" * w for w in widths)
 
-    print(f"  {header}")
-    print(f"  {divider}")
+    lines.append(f"  {header}")
+    lines.append(f"  {divider}")
 
-    # Rows
-    for conc in sorted(all_metrics.keys()):
-        m = all_metrics[conc]
+    # Sort by bench label then concurrency
+    sorted_keys = sorted(all_metrics.keys(), key=lambda k: (k[0], k[1]))
+    last_label = None
+
+    for key in sorted_keys:
+        bench_label, conc = key
+        m = all_metrics[key]
+
+        # Add separator between benchmark groups
+        if is_multi and last_label is not None and bench_label != last_label:
+            lines.append(f"  {divider}")
+        last_label = bench_label
+
         throughput = format_throughput(m.get("output_token_throughput", 0))
         req_s = format_throughput(m.get("request_throughput", 0))
         avg_lat = format_latency(m.get("avg_latency_ms", 0))
         p99_lat = format_latency(m.get("p99_latency_ms", 0))
 
-        row_vals = [
-            f"{conc:>{widths[0]}}",
-            f"{throughput + ' tok/s':>{widths[1]}}",
-            f"{req_s:>{widths[2]}}",
-            f"{avg_lat:>{widths[3]}}",
-            f"{p99_lat:>{widths[4]}}",
-        ]
+        row_vals = []
+        if is_multi:
+            label = prettify_bench_label(bench_label)
+            row_vals.append(f"{label:>{widths[0]}}")
+        idx = 1 if is_multi else 0
+        row_vals.extend([
+            f"{conc:>{widths[idx]}}",
+            f"{throughput + ' tok/s':>{widths[idx+1]}}",
+            f"{req_s:>{widths[idx+2]}}",
+            f"{avg_lat:>{widths[idx+3]}}",
+            f"{p99_lat:>{widths[idx+4]}}",
+        ])
         if has_ttft:
             ttft = format_latency(m.get("ttft_avg_ms", 0))
-            row_vals.append(f"{ttft:>{widths[5]}}")
+            row_vals.append(f"{ttft:>{widths[idx+5]}}")
         if has_itl:
             itl = format_latency(m.get("itl_avg_ms", 0))
             row_vals.append(f"{itl:>{widths[-1]}}")
 
-        print(f"  {' | '.join(row_vals)}")
+        lines.append(f"  {' | '.join(row_vals)}")
 
-    print()
-    print(separator)
+    lines.append("")
+    lines.append(separator)
 
-    # Save summary to file
-    summary_file = os.path.join(results_dir, "summary.txt")
-    with open(summary_file, "w") as f:
-        # Redirect output to file too
-        f.write(f"Benchmark Summary\n")
-        f.write(f"{'=' * 50}\n")
-        if system_info:
-            f.write(f"\nSystem Specs:\n{system_info}\n")
-        f.write(f"\nResults:\n")
-        f.write(f"  {header}\n")
-        f.write(f"  {divider}\n")
-        for conc in sorted(all_metrics.keys()):
-            m = all_metrics[conc]
-            throughput = format_throughput(m.get("output_token_throughput", 0))
-            req_s = format_throughput(m.get("request_throughput", 0))
-            avg_lat = format_latency(m.get("avg_latency_ms", 0))
-            p99_lat = format_latency(m.get("p99_latency_ms", 0))
-            row_vals = [
-                f"{conc:>{widths[0]}}",
-                f"{throughput + ' tok/s':>{widths[1]}}",
-                f"{req_s:>{widths[2]}}",
-                f"{avg_lat:>{widths[3]}}",
-                f"{p99_lat:>{widths[4]}}",
-            ]
-            if has_ttft:
-                ttft = format_latency(m.get("ttft_avg_ms", 0))
-                row_vals.append(f"{ttft:>{widths[5]}}")
-            if has_itl:
-                itl = format_latency(m.get("itl_avg_ms", 0))
-                row_vals.append(f"{itl:>{widths[-1]}}")
-            f.write(f"  {' | '.join(row_vals)}\n")
+    # Print to stdout
+    for line in lines:
+        print(line)
 
-    print(f"  Summary saved to: {summary_file}")
+    # ---- Save summary.txt ----
+    summary_txt = os.path.join(results_dir, "summary.txt")
+    with open(summary_txt, "w") as f:
+        for line in lines:
+            f.write(line + "\n")
+    print(f"  Summary saved to: {summary_txt}")
+
+    # ---- Generate summary.md (Markdown) ----
+    md_lines = []
+    md_lines.append(f"# Benchmark Summary — {host_name or 'Unknown Host'}")
+    md_lines.append("")
+    md_lines.append(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    if platform_type:
+        md_lines.append(f"**Platform:** {platform_type}")
+    if gpu_line:
+        md_lines.append(f"**GPU:** {gpu_line}")
+    md_lines.append("")
+
+    # Markdown table
+    md_cols = []
+    if is_multi:
+        md_cols.append("Benchmark")
+    md_cols.extend(["Concurrency", "Throughput (tok/s)", "Req/s", "Avg Latency", "P99 Latency"])
+    if has_ttft:
+        md_cols.append("TTFT (avg)")
+    if has_itl:
+        md_cols.append("ITL (avg)")
+
+    md_lines.append("| " + " | ".join(md_cols) + " |")
+    md_lines.append("| " + " | ".join("---" for _ in md_cols) + " |")
+
+    last_label = None
+    for key in sorted_keys:
+        bench_label, conc = key
+        m = all_metrics[key]
+
+        throughput = format_throughput(m.get("output_token_throughput", 0))
+        req_s = format_throughput(m.get("request_throughput", 0))
+        avg_lat = format_latency(m.get("avg_latency_ms", 0))
+        p99_lat = format_latency(m.get("p99_latency_ms", 0))
+
+        row = []
+        if is_multi:
+            label = prettify_bench_label(bench_label)
+            row.append(label)
+        row.extend([str(conc), throughput, req_s, avg_lat, p99_lat])
+        if has_ttft:
+            row.append(format_latency(m.get("ttft_avg_ms", 0)))
+        if has_itl:
+            row.append(format_latency(m.get("itl_avg_ms", 0)))
+
+        md_lines.append("| " + " | ".join(row) + " |")
+
+    md_lines.append("")
+
+    # System specs section
+    if system_info:
+        md_lines.append("## System Specifications")
+        md_lines.append("")
+        md_lines.append("```")
+        md_lines.append(system_info.strip())
+        md_lines.append("```")
+        md_lines.append("")
+
+    summary_md = os.path.join(results_dir, "summary.md")
+    with open(summary_md, "w") as f:
+        f.write("\n".join(md_lines) + "\n")
+    print(f"  Markdown saved to: {summary_md}")
     print()
 
 
