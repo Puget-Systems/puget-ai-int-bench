@@ -48,6 +48,7 @@ INPUT_TOKENS=500
 OUTPUT_TOKENS=500
 NUM_PROMPTS=50
 COMFY_ITERATIONS=10
+CONTEXT_LENGTHS=""  # e.g. "4096,32768,131072" — empty = use INPUT_TOKENS only
 
 # ============================================
 # Load Config File (if exists)
@@ -82,6 +83,7 @@ while [[ "$#" -gt 0 ]]; do
         --num-prompts) NUM_PROMPTS="$2"; shift ;;
         --ssh-key) SSH_KEY="$2"; shift ;;
         --comfy-iterations) COMFY_ITERATIONS="$2"; shift ;;
+        --context-lengths) CONTEXT_LENGTHS="$2"; shift ;;
         -h|--help)
             echo -e "${BLUE}Puget Systems AI App Pack — Automated Benchmark Suite${NC}"
             echo ""
@@ -101,6 +103,7 @@ while [[ "$#" -gt 0 ]]; do
             echo "  --branch NAME        App Pack git branch (default: main)"
             echo "  --ssh-key PATH       Path to SSH private key"
             echo "  --comfy-iterations N Number of images per ComfyUI benchmark run (default: 10)"
+            echo "  --context-lengths L  Comma-separated input token sizes to benchmark (e.g. 4096,32768,131072)"
             exit 0
             ;;
         *) echo -e "${RED}Unknown parameter: $1. Use --help for usage.${NC}"; exit 1 ;;
@@ -136,11 +139,17 @@ run_genai_perf_client() {
     local model="$3"
     local concurrency="$4"
     local results_dir="$5"
-    
+
     echo -e "  ${BLUE}Running genai-perf benchmark locally pointed at ${url}...${NC}"
-    
+
+    local ctx_arg=""
+    if [ -n "${CONTEXT_LENGTHS:-}" ]; then
+        ctx_arg="--context-lengths ${CONTEXT_LENGTHS}"
+    fi
+
     (
         cd "$SCRIPT_DIR/llm_tests"
+        # shellcheck disable=SC2086
         ./run_genai_perf.sh \
             --endpoint "$endpoint" \
             --url "$url" \
@@ -149,7 +158,8 @@ run_genai_perf_client() {
             --input-tokens "$INPUT_TOKENS" \
             --output-tokens "$OUTPUT_TOKENS" \
             --num-prompts "$NUM_PROMPTS" \
-            --results-dir "$results_dir"
+            --results-dir "$results_dir" \
+            $ctx_arg
     )
 }
 
@@ -361,6 +371,7 @@ if [ "$IS_BLACKWELL" = "true" ]; then
     echo -e "${GREEN}  Blackwell GPU detected (compute ${COMPUTE_CAP}) → using CUDA 13.0 paths${NC}"
 fi
 
+HF_MIRROR=""
 if [ -n "$CACHE_PROXY" ]; then
     echo -e "${GREEN}✓ Cache Proxy: ${CACHE_PROXY}${NC}"
     # Derive HF mirror URL from proxy host (port 8090 = puget_hf_mirror)
@@ -416,19 +427,43 @@ get_vllm_model_info() {
 }
 
 define_run_all_matrix() {
-    # Team LLM models (vLLM)
+    # ── Team LLM models (vLLM) ─────────────────────────────────────────
+    # BF16 / FP8 baseline (runs on any GPU)
     TEST_MATRIX+=("team_llm|1|Qwen3-8B|16||1")
+    if [ "$TOTAL_VRAM" -ge 24 ]; then
+        TEST_MATRIX+=("team_llm|3|Qwen3-14B|24||$CONCURRENCY")
+    fi
+    if [ "$TOTAL_VRAM" -ge 24 ]; then
+        TEST_MATRIX+=("team_llm|4|Qwen3-30B-A3B|24||$CONCURRENCY")  # MoE — low active params
+    fi
     if [ "$TOTAL_VRAM" -ge 40 ]; then
         TEST_MATRIX+=("team_llm|2|Qwen3-32B-FP8|40||$CONCURRENCY")
     fi
+    if [ "$TOTAL_VRAM" -ge 80 ]; then
+        TEST_MATRIX+=("team_llm|5|Qwen3-235B-A22B|80||$CONCURRENCY")  # MoE flagship
+    fi
 
-    # Personal LLM models (Ollama)
+    # NVFP4 variants — Blackwell only (GB200, RTX PRO 6000 Blackwell, etc.)
+    if [ "$IS_BLACKWELL" = "true" ]; then
+        TEST_MATRIX+=("team_llm|6|Qwen3-8B-FP4|16||$CONCURRENCY")
+        if [ "$TOTAL_VRAM" -ge 40 ]; then
+            TEST_MATRIX+=("team_llm|7|Qwen3-32B-FP4|40||$CONCURRENCY")
+        fi
+    fi
+
+    # ── Personal LLM models (Ollama) ───────────────────────────────────
     TEST_MATRIX+=("personal_llm|0|qwen3:8b|8|qwen3:8b|1")
+    if [ "$TOTAL_VRAM" -ge 12 ]; then
+        TEST_MATRIX+=("personal_llm|0|qwen3:14b|12|qwen3:14b|1")
+    fi
+    if [ "$TOTAL_VRAM" -ge 20 ]; then
+        TEST_MATRIX+=("personal_llm|0|qwen3:30b-a3b|20|qwen3:30b-a3b|1")
+    fi
     if [ "$TOTAL_VRAM" -ge 32 ]; then
         TEST_MATRIX+=("personal_llm|0|qwen3:32b|32|qwen3:32b|1")
     fi
 
-    # ComfyUI image generation
+    # ── ComfyUI image generation ────────────────────────────────────────
     if [ "$TOTAL_VRAM" -ge 16 ]; then
         TEST_MATRIX+=("comfy_ui|z_image_turbo|Z-Image Turbo|16||1")
     fi
@@ -501,20 +536,25 @@ download_if_missing() {
 }
 
 show_ollama_model_menu() {
-    echo "  1) Qwen 3 (8B)           - Fast, Low VRAM (~5 GB)"
-    echo "  2) Qwen 3 (32B)          - Best Quality, Single GPU (~20 GB)"
+    echo "  1) Qwen3 (8B)            - Fast, Low VRAM (~5 GB)"
+    echo "  2) Qwen3 (14B)           - Balanced quality/speed (~9 GB)"
+    echo "  3) Qwen3 (30B-A3B)       - MoE: big model, small active params (~20 GB)"
+    if [ "$TOTAL_VRAM" -ge 20 ]; then
+        echo "  4) Qwen3 (32B)           - Best single-GPU quality (~20 GB)"
+    else
+        echo -e "  4) Qwen3 (32B)           - ${RED}Requires ~20 GB VRAM${NC}"
+    fi
     if [ "$TOTAL_VRAM" -ge 40 ]; then
-        echo "  3) DeepSeek R1 (70B)     - Flagship Reasoning, Dual GPU (~42 GB)"
+        echo "  5) DeepSeek R1 (70B)     - Flagship Reasoning, Dual GPU (~42 GB)"
     else
-        echo -e "  3) DeepSeek R1 (70B)     - ${RED}Requires ~42 GB VRAM${NC}"
+        echo -e "  5) DeepSeek R1 (70B)     - ${RED}Requires ~42 GB VRAM${NC}"
     fi
-    echo "  4) Nemotron 3 Nano (30B) - NVIDIA MoE Reasoning (~24 GB)"
     if [ "$TOTAL_VRAM" -ge 80 ]; then
-        echo "  5) Nemotron 3 Super      - NVIDIA Flagship MoE (~96 GB)"
+        echo "  6) Qwen3 (235B-A22B)     - MoE flagship, high VRAM (~96 GB)"
     else
-        echo -e "  5) Nemotron 3 Super      - ${RED}Requires ~96 GB VRAM${NC}"
+        echo -e "  6) Qwen3 (235B-A22B)     - ${RED}Requires ~96 GB VRAM${NC}"
     fi
-    echo "  6) Custom tag            - Enter an Ollama model tag"
+    echo "  7) Custom tag            - Enter an Ollama model tag"
 }
 
 select_ollama_model() {
@@ -522,11 +562,12 @@ select_ollama_model() {
     OLLAMA_MODEL_TAG=""
     case $choice in
         1) OLLAMA_MODEL_TAG="qwen3:8b" ;;
-        2) OLLAMA_MODEL_TAG="qwen3:32b" ;;
-        3) OLLAMA_MODEL_TAG="deepseek-r1:70b" ;;
-        4) OLLAMA_MODEL_TAG="nemotron-3-nano:30b" ;;
-        5) OLLAMA_MODEL_TAG="nemotron-3-super" ;;
-        6)
+        2) OLLAMA_MODEL_TAG="qwen3:14b" ;;
+        3) OLLAMA_MODEL_TAG="qwen3:30b-a3b" ;;
+        4) OLLAMA_MODEL_TAG="qwen3:32b" ;;
+        5) OLLAMA_MODEL_TAG="deepseek-r1:70b" ;;
+        6) OLLAMA_MODEL_TAG="qwen3:235b-a22b" ;;
+        7)
             read -p "  Enter Ollama model tag: " OLLAMA_MODEL_TAG
             ;;
         *) return 1 ;;
@@ -727,6 +768,9 @@ TOOL_CALL_ARGS=
 EXTRA_VLLM_ARGS=
 MAX_CONTEXT=
 CACHE_PROXY=${CACHE_PROXY}
+HTTP_PROXY=${CACHE_PROXY}
+HTTPS_PROXY=${CACHE_PROXY}
+HF_ENDPOINT=${HF_MIRROR}
 ENVEOF
         else
             vllm_info=$(get_vllm_model_info "$BENCH_CHOICE") || { echo -e "${RED}✗ Required ${BENCH_MIN_VRAM}GB VRAM for choice $BENCH_CHOICE. Skip.${NC}"; continue; }
@@ -741,6 +785,9 @@ DTYPE=${m_dtype}
 MAX_CONTEXT=${m_ctx}
 REASONING_ARGS=${m_reason}
 CACHE_PROXY=${CACHE_PROXY}
+HTTP_PROXY=${CACHE_PROXY}
+HTTPS_PROXY=${CACHE_PROXY}
+HF_ENDPOINT=${HF_MIRROR}
 ENVEOF
         fi
 
@@ -773,6 +820,8 @@ ENVEOF
         target_cmd "cat > \"$WORK_DIR/.env\"" <<ENVEOF
 PUGET_APP_NAME=puget-bench-ollama
 CACHE_PROXY=${CACHE_PROXY}
+HTTP_PROXY=${CACHE_PROXY}
+HTTPS_PROXY=${CACHE_PROXY}
 ENVEOF
 
         echo -e "  ${BLUE}Starting Ollama on remote server...${NC}"

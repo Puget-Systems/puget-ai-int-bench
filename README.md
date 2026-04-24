@@ -76,12 +76,13 @@ The script will:
 | `--host USER@IP` | *(required)* | SSH target for the remote inference server |
 | `--cache-proxy URL` | *(none)* | Squid cache proxy for model downloads |
 | `--pack NAME` | *(interactive)* | `team_llm`, `personal_llm`, or `comfy_ui` |
-| `--model CHOICE` | *(interactive)* | Model menu number (1-9), model ID/tag, or ComfyUI workflow name |
+| `--model CHOICE` | *(interactive)* | Model menu number, model ID/tag, or ComfyUI workflow name |
 | `--run-all` | `false` | Run full VRAM-gated test matrix |
 | `--dry-run` | `false` | Validate setup without launching containers |
 | `--concurrency LIST` | `1,4,8,16` | Comma-separated concurrency levels (LLM only) |
+| `--context-lengths LIST` | *(none)* | Comma-separated input token sizes to sweep (e.g. `4096,32768,131072`) |
 | `--branch NAME` | `main` | App Pack git branch to clone |
-| `--input-tokens N` | `500` | Synthetic prompt length (LLM only) |
+| `--input-tokens N` | `500` | Default input token count (overridden by `--context-lengths`) |
 | `--output-tokens N` | `500` | Max generation length (LLM only) |
 | `--num-prompts N` | `50` | Prompts per concurrency level (LLM only) |
 | `--comfy-iterations N` | `10` | Number of images per ComfyUI benchmark run |
@@ -95,6 +96,7 @@ Persist defaults in `~/.config/puget-bench/bench.conf`:
 CACHE_PROXY=http://CACHE_PROXY_IP:3128
 APP_PACK_BRANCH=main
 CONCURRENCY=1,4,8,16
+CONTEXT_LENGTHS=4096,32768,131072
 ```
 
 See [bench.conf.example](bench.conf.example) for the template.
@@ -189,14 +191,23 @@ puget-ai-int-bench/
 
 When `--run-all` is specified, the following models are tested (filtered by available VRAM):
 
-| Pack | Model | Min VRAM | Concurrency / Iterations |
-|---|---|---|---|
-| Team LLM (vLLM) | Qwen/Qwen3-8B | 16 GB | 1 |
-| Team LLM (vLLM) | Qwen/Qwen3-32B-FP8 | 40 GB | 1,4,8,16 |
-| Personal LLM (Ollama) | qwen3:8b | 8 GB | 1 |
-| Personal LLM (Ollama) | qwen3:32b | 32 GB | 1 |
-| ComfyUI | Z-Image Turbo (BF16) | 16 GB | 10 images |
-| ComfyUI | Flux.2 Dev (FP8) | 40 GB | 10 images |
+| Pack | Model | Min VRAM | Type | Concurrency / Iterations |
+|---|---|---|---|---|
+| Team LLM (vLLM) | Qwen3-8B | 16 GB | BF16 | 1 |
+| Team LLM (vLLM) | Qwen3-14B | 24 GB | BF16 | 1,4,8,16 |
+| Team LLM (vLLM) | Qwen3-30B-A3B | 24 GB | FP8 MoE | 1,4,8,16 |
+| Team LLM (vLLM) | Qwen3-32B | 40 GB | FP8 | 1,4,8,16 |
+| Team LLM (vLLM) | Qwen3-235B-A22B | 80 GB | FP8 MoE | 1,4,8,16 |
+| Team LLM (vLLM) | Qwen3-8B FP4 ⚡ | 16 GB | NVFP4 | 1,4,8,16 |
+| Team LLM (vLLM) | Qwen3-32B FP4 ⚡ | 40 GB | NVFP4 | 1,4,8,16 |
+| Personal LLM (Ollama) | qwen3:8b | 8 GB | — | 1 |
+| Personal LLM (Ollama) | qwen3:14b | 12 GB | — | 1 |
+| Personal LLM (Ollama) | qwen3:30b-a3b | 20 GB | — | 1 |
+| Personal LLM (Ollama) | qwen3:32b | 32 GB | — | 1 |
+| ComfyUI | Z-Image Turbo (BF16) | 16 GB | — | 10 images |
+| ComfyUI | Flux.2 Dev (FP8) | 40 GB | — | 10 images |
+
+⚡ NVFP4 variants only run on Blackwell GPUs (GB200, RTX PRO 6000 Blackwell, etc.)
 
 ## Documentation
 
@@ -224,6 +235,15 @@ See [`findings/`](findings/) for detailed results and analysis.
 MIT — See [LICENSE](LICENSE)
 
 ## Changelog
+
+### v1.3.0
+
+- **Context window sweeps** — `--context-lengths 4096,32768,131072` benchmarks each size in a separate pass; results saved per `ctx{N}_concurrency_{C}` subdirectory
+- **FP4 (NVFP4) model variants** — Qwen3-8B-FP4 and Qwen3-32B-FP4 added to the vLLM menu and `--run-all` matrix, gated to Blackwell GPUs
+- **Latest models** — Qwen3-14B, Qwen3-30B-A3B (MoE), Qwen3-235B-A22B (MoE) added to vLLM and Ollama menus
+- **Cache fully wired for all packs** — `HF_ENDPOINT`, `HTTP_PROXY`, `HTTPS_PROXY` now injected into vLLM and Ollama `.env` files so the Squid proxy and HF mirror are actually used by the model containers
+- **Triton SDK image** updated to `25.04-py3-sdk`; `--sdk-image` override flag added to `run_genai_perf.sh`
+- **`HF_MIRROR` initialises to empty** before the `CACHE_PROXY` block to prevent unbound variable errors
 
 ### v1.2.0
 
