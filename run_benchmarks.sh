@@ -49,6 +49,8 @@ OUTPUT_TOKENS=500
 NUM_PROMPTS=50
 COMFY_ITERATIONS=10
 CONTEXT_LENGTHS=""  # e.g. "4096,32768,131072" — empty = use INPUT_TOKENS only
+SKIP_CHECKSUM=false
+HF_TOKEN=""         # HuggingFace token — load from bench.conf or --hf-token flag
 
 # ============================================
 # Load Config File (if exists)
@@ -84,6 +86,8 @@ while [[ "$#" -gt 0 ]]; do
         --ssh-key) SSH_KEY="$2"; shift ;;
         --comfy-iterations) COMFY_ITERATIONS="$2"; shift ;;
         --context-lengths) CONTEXT_LENGTHS="$2"; shift ;;
+        --skip-checksum) SKIP_CHECKSUM=true ;;
+        --hf-token) HF_TOKEN="$2"; shift ;;
         -h|--help)
             echo -e "${BLUE}Puget Systems AI App Pack — Automated Benchmark Suite${NC}"
             echo ""
@@ -327,7 +331,9 @@ echo ""
 echo -e "${YELLOW}[2/6] Verifying installer integrity on remote server...${NC}"
 
 CHECKSUM_FILE="$PACK_ROOT/install.sh.md5"
-if target_cmd "[ -f \"$CHECKSUM_FILE\" ]"; then
+if [ "$SKIP_CHECKSUM" = true ]; then
+    echo -e "${YELLOW}⚠ Skipping integrity check (--skip-checksum).${NC}"
+elif target_cmd "[ -f \"$CHECKSUM_FILE\" ]"; then
     EXPECTED_HASH=$(target_cmd "awk '{print \$1}' \"$CHECKSUM_FILE\"")
     # Determine hashing tool
     if target_cmd "command -v md5sum >/dev/null"; then
@@ -373,16 +379,24 @@ fi
 
 HF_MIRROR=""
 if [ -n "$CACHE_PROXY" ]; then
-    echo -e "${GREEN}✓ Cache Proxy: ${CACHE_PROXY}${NC}"
-    # Derive HF mirror URL from proxy host (port 8090 = puget_hf_mirror)
+    # First verify the proxy itself is reachable before trusting it
     _PROXY_HOST=$(echo "$CACHE_PROXY" | sed 's|http://||;s|:.*||')
-    HF_MIRROR="http://${_PROXY_HOST}:8090"
-    # Verify the mirror is reachable
-    if target_cmd "curl -sf --max-time 3 '${HF_MIRROR}/api/whoami' > /dev/null 2>&1"; then
-        echo -e "${GREEN}✓ HF Mirror: ${HF_MIRROR} (model downloads will be cached)${NC}"
+    _PROXY_PORT=$(echo "$CACHE_PROXY" | sed 's|.*:||')
+    if target_cmd "nc -z -w 2 '${_PROXY_HOST}' '${_PROXY_PORT}' 2>/dev/null || curl -sf --max-time 3 --proxy '' http://${_PROXY_HOST}:${_PROXY_PORT} >/dev/null 2>&1"; then
+        echo -e "${GREEN}✓ Cache Proxy: ${CACHE_PROXY}${NC}"
+        # Derive HF mirror URL from proxy host (port 8090 = puget_hf_mirror)
+        HF_MIRROR="http://${_PROXY_HOST}:8090"
+        # Verify the mirror is reachable
+        if target_cmd "curl -sf --max-time 3 '${HF_MIRROR}/api/whoami' > /dev/null 2>&1"; then
+            echo -e "${GREEN}✓ HF Mirror: ${HF_MIRROR} (model downloads will be cached)${NC}"
+        else
+            HF_MIRROR=""
+            echo -e "${YELLOW}⚠ HF Mirror not reachable at ${_PROXY_HOST}:8090 — direct downloads${NC}"
+        fi
     else
+        echo -e "${YELLOW}⚠ Cache Proxy ${CACHE_PROXY} is unreachable — disabling proxy for this run${NC}"
+        CACHE_PROXY=""
         HF_MIRROR=""
-        echo -e "${YELLOW}⚠ HF Mirror not reachable at ${_PROXY_HOST}:8090 — direct downloads${NC}"
     fi
 fi
 
@@ -782,6 +796,9 @@ for entry in "${TEST_MATRIX[@]}"; do
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
 
+    # Pre-flight: forcibly remove any stale bench containers left by aborted prior runs
+    target_cmd "docker rm -f puget_vllm puget_team_brain puget_team_webui puget_ollama 2>/dev/null; docker network prune -f 2>/dev/null" || true
+
     SAFE_MODEL_NAME=$(echo "$BENCH_MODEL" | tr '/:' '_')
     BENCH_RESULTS_DIR="$MASTER_RESULTS_DIR/${BENCH_PACK}_${SAFE_MODEL_NAME}"
     mkdir -p "$BENCH_RESULTS_DIR"
@@ -809,6 +826,8 @@ CACHE_PROXY=${CACHE_PROXY}
 HTTP_PROXY=${CACHE_PROXY}
 HTTPS_PROXY=${CACHE_PROXY}
 HF_ENDPOINT=${HF_MIRROR}
+HF_TOKEN=${HF_TOKEN}
+HUGGINGFACE_TOKEN=${HF_TOKEN}
 ENVEOF
         else
             vllm_info=$(get_vllm_model_info "$BENCH_CHOICE") || { echo -e "${RED}✗ Required ${BENCH_MIN_VRAM}GB VRAM for choice $BENCH_CHOICE. Skip.${NC}"; continue; }
@@ -826,10 +845,26 @@ CACHE_PROXY=${CACHE_PROXY}
 HTTP_PROXY=${CACHE_PROXY}
 HTTPS_PROXY=${CACHE_PROXY}
 HF_ENDPOINT=${HF_MIRROR}
+HF_TOKEN=${HF_TOKEN}
+HUGGINGFACE_TOKEN=${HF_TOKEN}
 ENVEOF
         fi
 
         echo -e "  ${BLUE}Starting vLLM on remote server...${NC}"
+
+        # Inject HF_TOKEN into the inference container via compose override.
+        # The app-pack compose file doesn't forward HF_TOKEN; this override merges on top.
+        if [ -n "$HF_TOKEN" ]; then
+            target_cmd "cat > \\\"$WORK_DIR/docker-compose.override.yml\\\"" <<OVERRIDE_EOF
+services:
+  inference:
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - HUGGINGFACE_TOKEN=${HF_TOKEN}
+      - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN}
+OVERRIDE_EOF
+        fi
+
         target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null; docker compose up -d"
         echo ""
 
@@ -860,6 +895,7 @@ PUGET_APP_NAME=puget-bench-ollama
 CACHE_PROXY=${CACHE_PROXY}
 HTTP_PROXY=${CACHE_PROXY}
 HTTPS_PROXY=${CACHE_PROXY}
+HF_TOKEN=${HF_TOKEN}
 ENVEOF
 
         echo -e "  ${BLUE}Starting Ollama on remote server...${NC}"
