@@ -47,6 +47,7 @@ SSH_KEY=""
 INPUT_TOKENS=500
 OUTPUT_TOKENS=500
 NUM_PROMPTS=50
+COMFY_ITERATIONS=10
 
 # ============================================
 # Load Config File (if exists)
@@ -80,6 +81,7 @@ while [[ "$#" -gt 0 ]]; do
         --output-tokens) OUTPUT_TOKENS="$2"; shift ;;
         --num-prompts) NUM_PROMPTS="$2"; shift ;;
         --ssh-key) SSH_KEY="$2"; shift ;;
+        --comfy-iterations) COMFY_ITERATIONS="$2"; shift ;;
         -h|--help)
             echo -e "${BLUE}Puget Systems AI App Pack — Automated Benchmark Suite${NC}"
             echo ""
@@ -90,7 +92,7 @@ while [[ "$#" -gt 0 ]]; do
             echo "Options:"
             echo "  --host USER@IP       (Required) SSH target for server-side operations"
             echo "  --cache-proxy URL    Squid cache proxy for model downloads"
-            echo "  --pack NAME          App Pack: team_llm, personal_llm"
+            echo "  --pack NAME          App Pack: team_llm, personal_llm, comfy_ui"
             echo "  --model CHOICE       Model menu number (1-9) or model ID string"
             echo "  --run-all            Run all VRAM-appropriate models automatically"
             echo "  --dry-run            Validate setup without launching containers"
@@ -98,6 +100,7 @@ while [[ "$#" -gt 0 ]]; do
             echo "  --repo URL           App Pack git repository URL or local path"
             echo "  --branch NAME        App Pack git branch (default: main)"
             echo "  --ssh-key PATH       Path to SSH private key"
+            echo "  --comfy-iterations N Number of images per ComfyUI benchmark run (default: 10)"
             exit 0
             ;;
         *) echo -e "${RED}Unknown parameter: $1. Use --help for usage.${NC}"; exit 1 ;;
@@ -360,7 +363,22 @@ fi
 
 if [ -n "$CACHE_PROXY" ]; then
     echo -e "${GREEN}✓ Cache Proxy: ${CACHE_PROXY}${NC}"
+    # Derive HF mirror URL from proxy host (port 8090 = puget_hf_mirror)
+    _PROXY_HOST=$(echo "$CACHE_PROXY" | sed 's|http://||;s|:.*||')
+    HF_MIRROR="http://${_PROXY_HOST}:8090"
+    # Verify the mirror is reachable
+    if target_cmd "curl -sf --max-time 3 '${HF_MIRROR}/api/whoami' > /dev/null 2>&1"; then
+        echo -e "${GREEN}✓ HF Mirror: ${HF_MIRROR} (model downloads will be cached)${NC}"
+    else
+        HF_MIRROR=""
+        echo -e "${YELLOW}⚠ HF Mirror not reachable at ${_PROXY_HOST}:8090 — direct downloads${NC}"
+    fi
 fi
+
+# Persistent model cache on remote host — survives across benchmark runs
+MODEL_CACHE_DIR="/opt/puget-model-cache"
+target_cmd "sudo mkdir -p '$MODEL_CACHE_DIR' && sudo chmod 775 '$MODEL_CACHE_DIR'" 2>/dev/null || \
+    target_cmd "mkdir -p '$MODEL_CACHE_DIR'" 2>/dev/null || true
 
 # System Specs Collection
 TARGET_HOSTNAME=$(target_cmd "hostname -s 2>/dev/null || hostname")
@@ -409,6 +427,77 @@ define_run_all_matrix() {
     if [ "$TOTAL_VRAM" -ge 32 ]; then
         TEST_MATRIX+=("personal_llm|0|qwen3:32b|32|qwen3:32b|1")
     fi
+
+    # ComfyUI image generation
+    if [ "$TOTAL_VRAM" -ge 16 ]; then
+        TEST_MATRIX+=("comfy_ui|z_image_turbo|Z-Image Turbo|16||1")
+    fi
+    if [ "$TOTAL_VRAM" -ge 40 ]; then
+        TEST_MATRIX+=("comfy_ui|flux2_dev|Flux.2 Dev FP8|40||1")
+    fi
+}
+
+run_comfyui_bench_client() {
+    local workflow_name="$1"
+    local url="$2"
+    local results_dir="$3"
+
+    local workflow_file="$SCRIPT_DIR/comfyui_tests/workflows/${workflow_name}_txt2img_api.json"
+    if [ ! -f "$workflow_file" ]; then
+        echo -e "  ${RED}✗ Workflow JSON not found: $workflow_file${NC}"
+        return 1
+    fi
+
+    echo -e "  ${BLUE}Running ComfyUI benchmark locally pointed at ${url}...${NC}"
+    chmod +x "$SCRIPT_DIR/comfyui_tests/run_comfyui_bench.sh"
+    (
+        cd "$SCRIPT_DIR/comfyui_tests"
+        ./run_comfyui_bench.sh \
+            --url "$url" \
+            --workflow "$workflow_file" \
+            --iterations "$COMFY_ITERATIONS" \
+            --results-dir "$results_dir"
+    )
+}
+
+download_if_missing() {
+    local comfy_dir="$1"
+    local dest_dir="$2"
+    local url="$3"
+    local filename
+    filename=$(basename "$url")
+    # Rewrite URL to use HF mirror if available
+    local dl_url="$url"
+    if [ -n "${HF_MIRROR:-}" ]; then
+        dl_url=$(echo "$url" | sed "s|https://huggingface.co|${HF_MIRROR}|")
+    fi
+    target_cmd "bash -c '
+        MODEL_CACHE_DIR=${MODEL_CACHE_DIR:-/opt/puget-model-cache}
+        dest=\"$comfy_dir/$dest_dir/$filename\"
+        cache=\"\$MODEL_CACHE_DIR/$dest_dir/$filename\"
+        # Already in work dir
+        if [ -f \"\$dest\" ]; then
+            echo \"  ✓ $filename (ready)\"; exit 0
+        fi
+        # Pull from persistent cache
+        if [ -f \"\$cache\" ]; then
+            echo \"  ✓ $filename (from model cache)\"
+            mkdir -p \"$comfy_dir/$dest_dir\"
+            cp \"\$cache\" \"\$dest\"
+            exit 0
+        fi
+        # Download fresh
+        echo \"  Downloading $filename...\"
+        mkdir -p \"\$MODEL_CACHE_DIR/$dest_dir\"
+        wget -q --show-progress -O \"\$cache\" \"$dl_url\" 2>\&1
+        wget_rc=\$?
+        if [ \$wget_rc -eq 0 ]; then
+            cp \"\$cache\" \"\$dest\"
+        else
+            rm -f \"\$cache\"
+            echo \"  ✗ Download failed: $filename\"
+            exit 1
+        fi'"
 }
 
 show_ollama_model_menu() {
@@ -480,6 +569,21 @@ elif [ -n "$PACK" ]; then
         else
             TEST_MATRIX+=("personal_llm|0|${MODEL_CHOICE}|0|${MODEL_CHOICE}|1")
         fi
+    elif [ "$PACK" = "comfy_ui" ]; then
+        # MODEL_CHOICE for comfy_ui is the workflow name
+        case "${MODEL_CHOICE:-z_image_turbo}" in
+            z_image_turbo|1) TEST_MATRIX+=("comfy_ui|z_image_turbo|Z-Image Turbo|16||1") ;;
+            flux2_dev|2)     TEST_MATRIX+=("comfy_ui|flux2_dev|Flux.2 Dev FP8|40||1") ;;
+            flux2_dev_multigpu|3) TEST_MATRIX+=("comfy_ui|flux2_dev_multigpu|Flux.2 Dev FP8 MultiGPU|40||1") ;;
+            flux2_dev_distorch2|4) TEST_MATRIX+=("comfy_ui|flux2_dev_distorch2|Flux.2 Dev FP8 DisTorch2|40||1") ;;
+            flux2_dev_2k|5) TEST_MATRIX+=("comfy_ui|flux2_dev_2k|Flux.2 Dev FP8 2K|40||1") ;;
+            flux2_dev_multigpu_2k|6) TEST_MATRIX+=("comfy_ui|flux2_dev_multigpu_2k|Flux.2 Dev FP8 MultiGPU 2K|40||1") ;;
+            flux2_dev_distorch2_2k|7) TEST_MATRIX+=("comfy_ui|flux2_dev_distorch2_2k|Flux.2 Dev FP8 DisTorch2 2K|40||1") ;;
+            *)
+                echo -e "${RED}✗ Unknown comfy_ui model: ${MODEL_CHOICE}${NC}"
+                exit 1
+                ;;
+        esac
     else
         echo -e "${RED}✗ Unknown pack: ${PACK}.${NC}"; exit 1
     fi
@@ -490,9 +594,10 @@ else
     echo "  Select an App Pack to benchmark:"
     echo "    1) Team LLM (vLLM)       — Production inference"
     echo "    2) Personal LLM (Ollama) — Single-user inference"
-    echo "    3) Run ALL               — Full test matrix"
+    echo "    3) ComfyUI (Image Gen)   — Z-Image Turbo / Flux.2 Dev"
+    echo "    4) Run ALL               — Full test matrix"
     echo ""
-    read -p "  Select [1-3]: " PACK_CHOICE
+    read -p "  Select [1-4]: " PACK_CHOICE
 
     case $PACK_CHOICE in
         1)
@@ -529,6 +634,30 @@ else
             fi
             ;;
         3)
+            PACK="comfy_ui"
+            echo ""
+            echo "  Select a model for ComfyUI:"
+            echo "    1) Z-Image Turbo (BF16) — Fast, high quality (~16 GB VRAM) [Recommended]"
+            if [ "$TOTAL_VRAM" -ge 40 ]; then
+                echo "    2) Flux.2 Dev (FP8)     — Flagship image gen (~40 GB VRAM)"
+            else
+                echo -e "    2) Flux.2 Dev (FP8)     — ${RED}Requires ~40 GB VRAM${NC}"
+            fi
+            echo ""
+            read -p "  Select [1-2]: " COMFY_CHOICE
+            case $COMFY_CHOICE in
+                1) TEST_MATRIX+=("comfy_ui|z_image_turbo|Z-Image Turbo|16||1") ;;
+                2)
+                    if [ "$TOTAL_VRAM" -lt 40 ]; then
+                        echo -e "${RED}✗ Insufficient VRAM for Flux.2 Dev (need ~40 GB, have ${TOTAL_VRAM} GB).${NC}"
+                        exit 1
+                    fi
+                    TEST_MATRIX+=("comfy_ui|flux2_dev|Flux.2 Dev FP8|40||1")
+                    ;;
+                *) echo -e "${RED}✗ Invalid selection.${NC}"; exit 1 ;;
+            esac
+            ;;
+        4)
             RUN_ALL=true
             define_run_all_matrix
             ;;
@@ -578,9 +707,11 @@ for entry in "${TEST_MATRIX[@]}"; do
     BENCH_RESULTS_DIR="$MASTER_RESULTS_DIR/${BENCH_PACK}_${SAFE_MODEL_NAME}"
     mkdir -p "$BENCH_RESULTS_DIR"
 
-    WORK_DIR="$REMOTE_TEMP_DIR/bench_${BENCH_PACK}_${SAFE_MODEL_NAME}"
-    target_cmd "cp -r \"$PACK_ROOT/packs/$BENCH_PACK\" \"$WORK_DIR\""
-    target_cmd "mkdir -p \"$WORK_DIR/scripts/lib\" && cp \"$PACK_ROOT/scripts/lib/\"*.sh \"$WORK_DIR/scripts/lib/\""
+    if [ "$BENCH_PACK" != "comfy_ui" ]; then
+        WORK_DIR="$REMOTE_TEMP_DIR/bench_${BENCH_PACK}_${SAFE_MODEL_NAME}"
+        target_cmd "cp -r \"$PACK_ROOT/packs/$BENCH_PACK\" \"$WORK_DIR\""
+        target_cmd "mkdir -p \"$WORK_DIR/scripts/lib\" && cp \"$PACK_ROOT/scripts/lib/\"*.sh \"$WORK_DIR/scripts/lib/\""
+    fi
 
     if [ "$BENCH_PACK" = "team_llm" ]; then
         if [[ "$BENCH_CHOICE" == "custom" || ! "$BENCH_CHOICE" =~ ^[0-9]+$ ]]; then
@@ -671,6 +802,101 @@ ENVEOF
         fi
 
         target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null"
+
+    elif [ "$BENCH_PACK" = "comfy_ui" ]; then
+        # ── ComfyUI: pre-download models, build, launch, benchmark, teardown ──
+
+        # Map workflow name → model files (mirrors init.sh EXTRA_DOWNLOADS logic)
+        COMFY_WORK_DIR="$REMOTE_TEMP_DIR/bench_comfy_ui_${BENCH_CHOICE}"
+        target_cmd "cp -r \"$PACK_ROOT/packs/comfy_ui\" \"$COMFY_WORK_DIR\""
+        target_cmd "mkdir -p \"$COMFY_WORK_DIR/scripts/lib\" && cp \"$PACK_ROOT/scripts/lib/\"*.sh \"$COMFY_WORK_DIR/scripts/lib/\""
+
+        # Create model subdirectories
+        for model_dir in models/diffusion_models models/vae models/text_encoders models/loras models/checkpoints; do
+            target_cmd "mkdir -p \"$COMFY_WORK_DIR/$model_dir\""
+        done
+
+        echo -e "  ${BLUE}Pre-downloading models for ${BENCH_MODEL}...${NC}"
+
+        case "$BENCH_CHOICE" in
+            z_image_turbo)
+                download_if_missing "$COMFY_WORK_DIR" "models/diffusion_models" \
+                    "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/diffusion_models/z_image_turbo_bf16.safetensors"
+                download_if_missing "$COMFY_WORK_DIR" "models/vae" \
+                    "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors"
+                download_if_missing "$COMFY_WORK_DIR" "models/text_encoders" \
+                    "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors"
+                ;;
+            flux2_dev|flux2_dev_multigpu|flux2_dev_distorch2|flux2_dev_2k|flux2_dev_multigpu_2k|flux2_dev_distorch2_2k)
+                # Choose text encoder based on per-GPU VRAM (ComfyUI uses single GPU)
+                PER_GPU_VRAM=$((TOTAL_VRAM / GPU_COUNT))
+                if [ "$PER_GPU_VRAM" -ge 48 ]; then
+                    FLUX2_TEXT_ENC="mistral_3_small_flux2_bf16.safetensors"
+                else
+                    FLUX2_TEXT_ENC="mistral_3_small_flux2_fp8.safetensors"
+                    echo -e "  ${YELLOW}Note: Using FP8 text encoder (${PER_GPU_VRAM} GB per-GPU VRAM).${NC}"
+                fi
+                download_if_missing "$COMFY_WORK_DIR" "models/diffusion_models" \
+                    "https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/diffusion_models/flux2_dev_fp8mixed.safetensors"
+                download_if_missing "$COMFY_WORK_DIR" "models/vae" \
+                    "https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/vae/flux2-vae.safetensors"
+                download_if_missing "$COMFY_WORK_DIR" "models/text_encoders" \
+                    "https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/text_encoders/${FLUX2_TEXT_ENC}"
+                download_if_missing "$COMFY_WORK_DIR" "models/loras" \
+                    "https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/loras/Flux_2-Turbo-LoRA_comfyui.safetensors"
+                ;;
+            *)
+                echo -e "  ${RED}✗ Unknown comfy_ui workflow: ${BENCH_CHOICE}. Skipping.${NC}"
+                FAILED_BENCHMARKS+=("$BENCH_MODEL (unknown workflow)")
+                continue
+                ;;
+        esac
+
+        # Install ComfyUI-MultiGPU extension if needed for multi-GPU workflows
+        case "$BENCH_CHOICE" in
+            *multigpu*|*distorch2*)
+                if ! target_cmd "test -d '$COMFY_WORK_DIR/custom_nodes/ComfyUI-MultiGPU'"; then
+                    echo -e "  ${BLUE}Installing ComfyUI-MultiGPU custom node...${NC}"
+                    target_cmd "git clone --depth 1 https://github.com/pollockjj/ComfyUI-MultiGPU.git '$COMFY_WORK_DIR/custom_nodes/ComfyUI-MultiGPU'"
+                    target_cmd "chmod -R 775 '$COMFY_WORK_DIR/custom_nodes/ComfyUI-MultiGPU'"
+                    echo -e "  ${GREEN}✓ ComfyUI-MultiGPU installed.${NC}"
+                fi
+                ;;
+        esac
+
+        # Workaround: numpy 2.4.x has a "cannot load module more than once" bug on Python 3.12
+        # Pin numpy<2.4 in the Dockerfile before PyTorch install picks up an incompatible version
+        target_cmd "grep -q 'numpy<2.4' \"$COMFY_WORK_DIR/Dockerfile\" || sed -i '/^RUN pip install.*torch.*torchvision/i RUN pip install --no-cache-dir \"numpy<2.4\"' \"$COMFY_WORK_DIR/Dockerfile\""
+
+        # Build container (smart_build skips if fingerprint unchanged)
+        echo -e "  ${BLUE}Building ComfyUI container on remote server (smart build)...${NC}"
+        target_cmd "bash -c 'source \"$COMFY_WORK_DIR/scripts/lib/smart_build.sh\" && cd \"$COMFY_WORK_DIR\" && smart_build'"
+
+        # Launch
+        echo -e "  ${BLUE}Starting ComfyUI on remote server...${NC}"
+        # Fix ownership on volume-mount dirs (container runs as UID 999, GID 1500)
+        target_cmd "mkdir -p \"$COMFY_WORK_DIR/output\" \"$COMFY_WORK_DIR/input\" \"$COMFY_WORK_DIR/custom_nodes\""
+        target_cmd "chmod -R 775 \"$COMFY_WORK_DIR/output\" \"$COMFY_WORK_DIR/input\" 2>/dev/null || true"
+        target_cmd "cd \"$COMFY_WORK_DIR\" && docker compose down 2>/dev/null; docker compose up -d"
+
+        # Wait for API (port 8188)
+        echo -e "  ${YELLOW}Waiting for ComfyUI API on port 8188...${NC}"
+        if ! target_cmd "bash -c 'for i in {1..60}; do curl -s --max-time 3 http://localhost:8188/api/system_stats >/dev/null 2>&1 && exit 0; sleep 5; done; exit 1'"; then
+            echo -e "  ${RED}✗ ComfyUI API not responding after 300s. Skipping.${NC}"
+            target_cmd "cd \"$COMFY_WORK_DIR\" && docker compose logs --tail 20"
+            target_cmd "cd \"$COMFY_WORK_DIR\" && docker compose down 2>/dev/null"
+            FAILED_BENCHMARKS+=("$BENCH_MODEL (ComfyUI failed to start)")
+            continue
+        fi
+        echo -e "  ${GREEN}✓ ComfyUI API ready.${NC}"
+
+        echo ""
+        if ! run_comfyui_bench_client "$BENCH_CHOICE" "${BENCH_URL_BASE}:8188" "$BENCH_RESULTS_DIR"; then
+            echo -e "  ${RED}✗ ComfyUI benchmark failed for ${BENCH_MODEL}${NC}"
+            FAILED_BENCHMARKS+=("${BENCH_MODEL} (benchmark failed)")
+        fi
+
+        target_cmd "cd \"$COMFY_WORK_DIR\" && docker compose down 2>/dev/null"
     fi
 done
 

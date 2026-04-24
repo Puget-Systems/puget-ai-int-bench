@@ -8,7 +8,7 @@ Fully automated performance benchmarking for [Puget Docker App Packs](https://gi
 
 - **Team LLM** (vLLM) — multi-user serving via the `team_llm` app pack
 - **Personal LLM** (Ollama) — single-user inference via the `personal_llm` app pack
-- **ComfyUI** — image generation latency *(planned)*
+- **ComfyUI** — image generation throughput and latency (Z-Image Turbo, Flux.2 Dev single/multi-GPU/DisTorch2)
 
 ## Prerequisites
 
@@ -17,7 +17,7 @@ Fully automated performance benchmarking for [Puget Docker App Packs](https://gi
 | **Docker** | With NVIDIA Container Toolkit |
 | **NVIDIA GPU + Drivers** | `nvidia-smi` must work |
 | **Git** | For cloning the App Pack repository |
-| **Python 3** | For summary report generation |
+| **Python 3** | For summary report + ComfyUI benchmark client |
 
 ## Quick Start
 
@@ -38,12 +38,13 @@ cd puget-ai-int-bench
 The script will:
 1. **Clone** the App Pack repository to a temp directory (with MD5 integrity check)
 2. **Detect** your GPU hardware (model, VRAM, compute capability)
-3. **Prompt** you to select an App Pack and model
-4. **Launch** the App Pack via `docker compose`
-5. **Wait** for the model to download and load (with progress monitoring)
-6. **Run** genai-perf benchmarks at specified concurrency levels
-7. **Tear down** the App Pack
-8. **Generate** a summary report (text + Markdown)
+3. **Prompt** you to select an App Pack and model/workflow
+4. **Pre-download** model weights (with persistent caching + optional HF mirror)
+5. **Launch** the App Pack via `docker compose`
+6. **Wait** for the model to download and load (with progress monitoring)
+7. **Run** benchmarks (genai-perf for LLMs, or ComfyUI REST/WebSocket client for image gen)
+8. **Tear down** the App Pack
+9. **Generate** a summary report (text + Markdown)
 
 ### Non-Interactive Mode
 
@@ -51,6 +52,15 @@ The script will:
 # Benchmark a specific pack + model
 ./run_benchmarks.sh --host USER@IP --pack team_llm --model 1        # Qwen3-8B
 ./run_benchmarks.sh --host USER@IP --pack personal_llm --model 2     # qwen3:32b
+
+# ComfyUI benchmarks
+./run_benchmarks.sh --host USER@IP --pack comfy_ui --model z_image_turbo
+./run_benchmarks.sh --host USER@IP --pack comfy_ui --model flux2_dev
+./run_benchmarks.sh --host USER@IP --pack comfy_ui --model flux2_dev_multigpu
+./run_benchmarks.sh --host USER@IP --pack comfy_ui --model flux2_dev_distorch2
+./run_benchmarks.sh --host USER@IP --pack comfy_ui --model flux2_dev_2k          # 2K resolution variants
+./run_benchmarks.sh --host USER@IP --pack comfy_ui --model flux2_dev_multigpu_2k
+./run_benchmarks.sh --host USER@IP --pack comfy_ui --model flux2_dev_distorch2_2k
 
 # Run ALL VRAM-appropriate models automatically
 ./run_benchmarks.sh --host USER@IP --run-all
@@ -65,15 +75,16 @@ The script will:
 |---|---|---|
 | `--host USER@IP` | *(required)* | SSH target for the remote inference server |
 | `--cache-proxy URL` | *(none)* | Squid cache proxy for model downloads |
-| `--pack NAME` | *(interactive)* | `team_llm` or `personal_llm` |
-| `--model CHOICE` | *(interactive)* | Model menu number (1-9) or model ID/tag |
+| `--pack NAME` | *(interactive)* | `team_llm`, `personal_llm`, or `comfy_ui` |
+| `--model CHOICE` | *(interactive)* | Model menu number (1-9), model ID/tag, or ComfyUI workflow name |
 | `--run-all` | `false` | Run full VRAM-gated test matrix |
 | `--dry-run` | `false` | Validate setup without launching containers |
-| `--concurrency LIST` | `1,4,8,16` | Comma-separated concurrency levels |
+| `--concurrency LIST` | `1,4,8,16` | Comma-separated concurrency levels (LLM only) |
 | `--branch NAME` | `main` | App Pack git branch to clone |
-| `--input-tokens N` | `500` | Synthetic prompt length |
-| `--output-tokens N` | `500` | Max generation length |
-| `--num-prompts N` | `50` | Prompts per concurrency level |
+| `--input-tokens N` | `500` | Synthetic prompt length (LLM only) |
+| `--output-tokens N` | `500` | Max generation length (LLM only) |
+| `--num-prompts N` | `50` | Prompts per concurrency level (LLM only) |
+| `--comfy-iterations N` | `10` | Number of images per ComfyUI benchmark run |
 | `--ssh-key PATH` | *(none)* | Path to SSH private key |
 
 ### Config File
@@ -90,32 +101,50 @@ See [bench.conf.example](bench.conf.example) for the template.
 
 ## Model Caching
 
-The benchmark suite integrates with the existing Puget infrastructure cache:
+The benchmark suite uses a three-tier caching strategy to avoid re-downloading multi-GB model weights:
+
+1. **Work directory** — if the model is already in the benchmark work dir, use it
+2. **Persistent cache** (`/opt/puget-model-cache`) — survives across benchmark runs on the same host
+3. **Fresh download** — from HuggingFace (or HF mirror if `--cache-proxy` is set)
+
+Additional infrastructure caching:
 
 - **Squid HTTP Proxy**: Caches HuggingFace model downloads on the LAN. Set `--cache-proxy` or `CACHE_PROXY` in your config.
+- **HF Mirror** (port 8090): Auto-detected from the cache proxy host. Rewrites HuggingFace URLs to the local mirror.
 - **NFS Model Server**: GPU VMs can mount shared model storage from the cache-proxy VM.
 - Both are provisioned via [puget-hypervisor-devops](https://github.com/Puget-Systems/puget-hypervisor-devops) Terraform.
-
-First download of a model goes through the proxy and is cached. Subsequent downloads (even on different machines on the same LAN) hit the cache.
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  run_benchmarks.sh                                               │
-│                                                                  │
-│  1. git clone puget-docker-app-pack → /tmp (MD5 verified)       │
-│  2. Source shared libs (gpu_detect, vllm_model_select, etc.)    │
-│  3. For each (pack, model) in test matrix:                       │
-│     ┌─────────────────────────────────────┐                      │
-│     │  Write .env (model, cache proxy)    │                      │
-│     │  docker compose up -d               │                      │
-│     │  Wait for API health                │  ← vllm_monitor.sh  │
-│     │  genai-perf benchmark               │  ← run_genai_perf.sh│
-│     │  docker compose down                │                      │
-│     └─────────────────────────────────────┘                      │
-│  4. generate_summary.py → summary.txt + summary.md              │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  run_benchmarks.sh                                                   │
+│                                                                      │
+│  1. git clone puget-docker-app-pack → /tmp (MD5 verified)           │
+│  2. Source shared libs (gpu_detect, vllm_model_select, etc.)        │
+│  3. For each (pack, model) in test matrix:                           │
+│                                                                      │
+│     LLM packs (team_llm / personal_llm):                            │
+│     ┌──────────────────────────────────────────┐                     │
+│     │  Write .env (model, cache proxy)         │                     │
+│     │  docker compose up -d                    │                     │
+│     │  Wait for API health                     │ ← vllm_monitor.sh  │
+│     │  genai-perf benchmark                    │ ← run_genai_perf.sh│
+│     │  docker compose down                     │                     │
+│     └──────────────────────────────────────────┘                     │
+│                                                                      │
+│     ComfyUI pack (comfy_ui):                                        │
+│     ┌──────────────────────────────────────────┐                     │
+│     │  Pre-download models (3-tier cache)       │                     │
+│     │  Install MultiGPU extension (if needed)  │                     │
+│     │  docker compose build + up -d            │ ← smart_build.sh   │
+│     │  Wait for API (:8188)                    │                     │
+│     │  Python bench client (REST + WebSocket)  │ ← run_comfyui_bench│
+│     │  docker compose down                     │                     │
+│     └──────────────────────────────────────────┘                     │
+│                                                                      │
+│  4. generate_summary.py → summary.txt + summary.md                  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Benchmark Parameters
@@ -139,10 +168,19 @@ puget-ai-int-bench/
 ├── llm_tests/
 │   ├── run_genai_perf.sh          # genai-perf Docker runner
 │   └── generate_summary.py        # Summary report generator (txt + md)
+├── comfyui_tests/
+│   ├── run_comfyui_bench.sh       # Shell wrapper (venv setup, invokes Python)
+│   ├── run_comfyui_bench.py       # Headless ComfyUI benchmark (REST + WebSocket)
+│   ├── requirements.txt           # Python deps (requests, websockets)
+│   └── workflows/                 # API-format workflow JSONs
+│       ├── z_image_turbo_txt2img_api.json
+│       ├── flux2_dev_txt2img_api.json
+│       ├── flux2_dev_multigpu_txt2img_api.json
+│       ├── flux2_dev_distorch2_txt2img_api.json
+│       └── ..._2k_*.json          # 2048×2048 resolution variants
 ├── docs/
 │   └── glossary.md                # Benchmark metrics glossary
 ├── archive/                        # Deprecated scripts kept for reference
-├── comfyui_tests/                  # (Planned) ComfyUI latency benchmarks
 ├── findings/                       # Synthesized reports & analysis
 └── results/                        # Raw benchmark data (per-run)
 ```
@@ -151,12 +189,14 @@ puget-ai-int-bench/
 
 When `--run-all` is specified, the following models are tested (filtered by available VRAM):
 
-| Pack | Model | Min VRAM | Concurrency |
+| Pack | Model | Min VRAM | Concurrency / Iterations |
 |---|---|---|---|
 | Team LLM (vLLM) | Qwen/Qwen3-8B | 16 GB | 1 |
 | Team LLM (vLLM) | Qwen/Qwen3-32B-FP8 | 40 GB | 1,4,8,16 |
 | Personal LLM (Ollama) | qwen3:8b | 8 GB | 1 |
 | Personal LLM (Ollama) | qwen3:32b | 32 GB | 1 |
+| ComfyUI | Z-Image Turbo (BF16) | 16 GB | 10 images |
+| ComfyUI | Flux.2 Dev (FP8) | 40 GB | 10 images |
 
 ## Documentation
 
@@ -184,6 +224,17 @@ See [`findings/`](findings/) for detailed results and analysis.
 MIT — See [LICENSE](LICENSE)
 
 ## Changelog
+
+### v1.2.0
+
+- **ComfyUI benchmark support** — full lifecycle: model pre-download, container build, headless benchmark via REST + WebSocket, teardown
+- **7 workflow variants** — Z-Image Turbo, Flux.2 Dev × {single, MultiGPU, DisTorch2} × {1K, 2K} resolutions
+- **Python benchmark client** — per-iteration timing, random seed injection, CSV + JSON output, VRAM snapshots
+- **3-tier model caching** — work dir → `/opt/puget-model-cache` → fresh download (with HF mirror support)
+- **HF mirror auto-detection** — derives mirror URL from `--cache-proxy` host on port 8090
+- **`--comfy-iterations`** — configurable number of images per benchmark run (default: 10)
+- **Security hardening** — tightened `chmod 775` (was 777), fixed wget pipeline exit-code masking, idempotent Dockerfile patching
+- **Code quality** — hoisted `download_if_missing()` out of loop, skipped duplicate pack copies, added `requirements.txt`
 
 ### v1.1.0
 

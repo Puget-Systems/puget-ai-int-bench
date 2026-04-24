@@ -3,3 +3,4 @@ llm_tests/__pycache__/
 *.pyc
 bench.conf
 .DS_Store
+.venv/
