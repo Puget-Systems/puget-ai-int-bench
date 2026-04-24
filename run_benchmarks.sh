@@ -855,12 +855,16 @@ ENVEOF
 
         echo -e "  ${BLUE}Starting vLLM on remote server...${NC}"
 
-        # Inject HF_TOKEN into the inference container via compose override.
-        # The app-pack compose file doesn't forward HF_TOKEN; this override merges on top.
+        # Inject HF_TOKEN and shared model cache via compose override.
+        # The app-pack compose creates a per-project vllm_cache volume; we override
+        # it to use a single shared external volume so models download once.
+        target_cmd "docker volume create shared_vllm_cache 2>/dev/null || true"
+        _OVERRIDE="services:\n  inference:\n"
         if [ -n "$HF_TOKEN" ]; then
-            _OVERRIDE_CONTENT="services:\n  inference:\n    environment:\n      - HF_TOKEN=${HF_TOKEN}\n      - HUGGINGFACE_TOKEN=${HF_TOKEN}\n      - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN}\n"
-            target_cmd "printf '${_OVERRIDE_CONTENT}' > \"${WORK_DIR}/docker-compose.override.yml\""
+            _OVERRIDE+="    environment:\n      - HF_TOKEN=${HF_TOKEN}\n      - HUGGINGFACE_TOKEN=${HF_TOKEN}\n      - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN}\n"
         fi
+        _OVERRIDE+="volumes:\n  vllm_cache:\n    external: true\n    name: shared_vllm_cache\n"
+        target_cmd "printf '${_OVERRIDE}' > \"${WORK_DIR}/docker-compose.override.yml\""
 
         # For Gemma4: the Dockerfile.gemma4 bakes transformers>=5.5 into the image.
         # Without this build step, the stock vLLM image can't load Gemma4 weights.
@@ -903,6 +907,10 @@ HF_TOKEN=${HF_TOKEN}
 ENVEOF
 
         echo -e "  ${BLUE}Starting Ollama on remote server...${NC}"
+        # Share a single Ollama data volume across all personal_llm benchmarks
+        target_cmd "docker volume create shared_ollama_data 2>/dev/null || true"
+        _OL_OVERRIDE="volumes:\n  ollama_data:\n    external: true\n    name: shared_ollama_data\n"
+        target_cmd "printf '${_OL_OVERRIDE}' > \"${WORK_DIR}/docker-compose.override.yml\""
         target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null; docker compose up -d"
 
         echo -e "  ${YELLOW}Waiting for Ollama API...${NC}"
