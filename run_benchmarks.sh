@@ -855,14 +855,8 @@ ENVEOF
         # Inject HF_TOKEN into the inference container via compose override.
         # The app-pack compose file doesn't forward HF_TOKEN; this override merges on top.
         if [ -n "$HF_TOKEN" ]; then
-            target_cmd "cat > \\\"$WORK_DIR/docker-compose.override.yml\\\"" <<OVERRIDE_EOF
-services:
-  inference:
-    environment:
-      - HF_TOKEN=${HF_TOKEN}
-      - HUGGINGFACE_TOKEN=${HF_TOKEN}
-      - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN}
-OVERRIDE_EOF
+            _OVERRIDE_CONTENT="services:\n  inference:\n    environment:\n      - HF_TOKEN=${HF_TOKEN}\n      - HUGGINGFACE_TOKEN=${HF_TOKEN}\n      - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN}\n"
+            target_cmd "printf '${_OVERRIDE_CONTENT}' > \"${WORK_DIR}/docker-compose.override.yml\""
         fi
 
         target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null; docker compose up -d"
