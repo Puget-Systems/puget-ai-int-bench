@@ -429,9 +429,9 @@ declare -a TEST_MATRIX=()
 # We can't interactively prompt the user from a remote bash session easily, so we parse options locally.
 get_vllm_model_info() {
     local choice="$1"
-    # Execute vllm_model_select.sh functions remotely and capture variables
+    # Execute vllm_model_select.sh functions remotely and capture ALL variables
     local remote_out
-    remote_out=$(target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\"; detect_gpus >/dev/null; source \"$PACK_ROOT/scripts/lib/vllm_model_select.sh\"; if select_vllm_model \"$choice\" >/dev/null 2>&1; then echo \"OK|\$VLLM_MODEL_ID|\$VLLM_IMAGE|\$VLLM_GPU_COUNT|\$VLLM_GPU_MEM_UTIL|\$VLLM_DTYPE|\$VLLM_MAX_CTX|\$VLLM_REASONING_ARGS\"; else echo \"FAIL\"; fi'")
+    remote_out=$(target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\"; detect_gpus >/dev/null; source \"$PACK_ROOT/scripts/lib/vllm_model_select.sh\"; if select_vllm_model \"$choice\" >/dev/null 2>&1; then echo \"OK|\$VLLM_MODEL_ID|\$VLLM_IMAGE|\$VLLM_GPU_COUNT|\$VLLM_GPU_MEM_UTIL|\$VLLM_DTYPE|\$VLLM_MAX_CTX|\$VLLM_REASONING_ARGS|\$VLLM_EXTRA_ARGS|\$VLLM_TOOL_CALL_ARGS|\$VLLM_THINKING_ARGS\"; else echo \"FAIL\"; fi'")
     
     if [[ "$remote_out" == FAIL* || -z "$remote_out" ]]; then
         return 1
@@ -831,7 +831,7 @@ HUGGINGFACE_TOKEN=${HF_TOKEN}
 ENVEOF
         else
             vllm_info=$(get_vllm_model_info "$BENCH_CHOICE") || { echo -e "${RED}✗ Required ${BENCH_MIN_VRAM}GB VRAM for choice $BENCH_CHOICE. Skip.${NC}"; continue; }
-            IFS='|' read -r status m_id m_img m_gpus m_mem m_dtype m_ctx m_reason <<< "$vllm_info"
+            IFS='|' read -r status m_id m_img m_gpus m_mem m_dtype m_ctx m_reason m_extra m_tool m_thinking <<< "$vllm_info"
             BENCH_MODEL="$m_id" # update to true ID
             target_cmd "cat > \"$WORK_DIR/.env\"" <<ENVEOF
 MODEL_ID=${m_id}
@@ -841,6 +841,9 @@ GPU_MEMORY_UTILIZATION=${m_mem}
 DTYPE=${m_dtype}
 MAX_CONTEXT=${m_ctx}
 REASONING_ARGS=${m_reason}
+EXTRA_VLLM_ARGS=${m_extra}
+TOOL_CALL_ARGS=${m_tool}
+THINKING_ARGS=${m_thinking}
 CACHE_PROXY=${CACHE_PROXY}
 HTTP_PROXY=${CACHE_PROXY}
 HTTPS_PROXY=${CACHE_PROXY}
@@ -857,6 +860,13 @@ ENVEOF
         if [ -n "$HF_TOKEN" ]; then
             _OVERRIDE_CONTENT="services:\n  inference:\n    environment:\n      - HF_TOKEN=${HF_TOKEN}\n      - HUGGINGFACE_TOKEN=${HF_TOKEN}\n      - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN}\n"
             target_cmd "printf '${_OVERRIDE_CONTENT}' > \"${WORK_DIR}/docker-compose.override.yml\""
+        fi
+
+        # For Gemma4: the Dockerfile.gemma4 bakes transformers>=5.5 into the image.
+        # Without this build step, the stock vLLM image can't load Gemma4 weights.
+        if echo "$BENCH_MODEL" | grep -qi "gemma.4"; then
+            echo -e "  ${YELLOW}Building Gemma4-compatible vLLM image (transformers>=5.5)...${NC}"
+            target_cmd "cd \"$WORK_DIR\" && docker compose build inference"
         fi
 
         target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null; docker compose up -d"

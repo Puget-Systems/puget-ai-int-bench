@@ -118,14 +118,12 @@ for CTX in "${CTX_LIST[@]}"; do
             genai-perf profile \
             -m "$MODEL_NAME" \
             --endpoint-type chat \
-            --service-kind openai \
             -u "$URL" \
             --num-prompts "$NUM_PROMPTS" \
             --synthetic-input-tokens-mean "$CTX" \
             --output-tokens-mean "$OUTPUT_TOKENS" \
             --concurrency "$CONC" \
             --artifact-dir "results/${ARTIFACT_SUBDIR}" \
-            -- \
             --measurement-interval 120000 \
             --stability-percentage 999
 
