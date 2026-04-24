@@ -189,25 +189,39 @@ puget-ai-int-bench/
 
 ## "Run ALL" Default Matrix
 
-When `--run-all` is specified, the following models are tested (filtered by available VRAM):
+When `--run-all` is specified, the following models are tested (filtered by available VRAM). Model choices map 1:1 to the app-pack menus.
 
-| Pack | Model | Min VRAM | Type | Concurrency / Iterations |
+### Team LLM (vLLM)
+
+| # | Model | HF ID | Min VRAM | Notes |
 |---|---|---|---|---|
-| Team LLM (vLLM) | Qwen3-8B | 16 GB | BF16 | 1 |
-| Team LLM (vLLM) | Qwen3-14B | 24 GB | BF16 | 1,4,8,16 |
-| Team LLM (vLLM) | Qwen3-30B-A3B | 24 GB | FP8 MoE | 1,4,8,16 |
-| Team LLM (vLLM) | Qwen3-32B | 40 GB | FP8 | 1,4,8,16 |
-| Team LLM (vLLM) | Qwen3-235B-A22B | 80 GB | FP8 MoE | 1,4,8,16 |
-| Team LLM (vLLM) | Qwen3-8B FP4 ⚡ | 16 GB | NVFP4 | 1,4,8,16 |
-| Team LLM (vLLM) | Qwen3-32B FP4 ⚡ | 40 GB | NVFP4 | 1,4,8,16 |
-| Personal LLM (Ollama) | qwen3:8b | 8 GB | — | 1 |
-| Personal LLM (Ollama) | qwen3:14b | 12 GB | — | 1 |
-| Personal LLM (Ollama) | qwen3:30b-a3b | 20 GB | — | 1 |
-| Personal LLM (Ollama) | qwen3:32b | 32 GB | — | 1 |
-| ComfyUI | Z-Image Turbo (BF16) | 16 GB | — | 10 images |
-| ComfyUI | Flux.2 Dev (FP8) | 40 GB | — | 10 images |
+| 1 | Qwen 3.6 35B MoE AWQ | `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit` | 22 GB | 128K ctx, always runs |
+| 2 | Qwen 3.5 35B MoE AWQ | `cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit` | 22 GB | 256K ctx |
+| 3 | Qwen 3.5 122B MoE AWQ | `cyankiwi/Qwen3.5-122B-A10B-AWQ-4bit` | 80 GB | 128K ctx |
+| 4 | DeepSeek R1 70B AWQ | `Valdemardi/DeepSeek-R1-Distill-Llama-70B-AWQ` | 40 GB | Reasoning specialist |
+| 5 | Nemotron 3 Nano 30B | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` | 20 GB | NVFP4, always runs |
+| 6 | Nemotron 3 Super 120B | `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` | 80 GB | NVFP4 flagship |
+| 7 | Gemma 4 26B MoE AWQ | `cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit` | 20 GB | Google MoE |
+| 8 | GPT-OSS 20B MXFP4 | `openai/gpt-oss-20b` | 16 GB | OpenAI open-weight, always runs |
+| 9 | GPT-OSS 120B MXFP4 | `openai/gpt-oss-120b` | 80 GB | OpenAI flagship open-weight |
 
-⚡ NVFP4 variants only run on Blackwell GPUs (GB200, RTX PRO 6000 Blackwell, etc.)
+### Personal LLM (Ollama)
+
+| # | Model | Tag | Min VRAM | Notes |
+|---|---|---|---|---|
+| 1 | Qwen 3.6 35B MoE | `qwen3.6:35b` | 24 GB | Agentic coding, 256K ctx |
+| 2 | DeepSeek R1 70B | `deepseek-r1:70b` | 42 GB | Flagship reasoning |
+| 3 | Llama 4 Scout | `llama4:scout` | 63 GB | Multimodal (text+image) |
+| 4 | Nemotron 3 Nano 30B | `nemotron-3-nano:30b` | 24 GB | NVIDIA MoE reasoning |
+| 5 | Nemotron 3 Super | `nemotron-3-super` | 96 GB | NVIDIA flagship MoE |
+| 6 | Gemma 4 31B | `gemma4:31b` | 20 GB | Google dense instruct |
+
+### ComfyUI (Image Gen)
+
+| Workflow | Min VRAM | Notes |
+|---|---|---|
+| Z-Image Turbo (BF16) | 16 GB | Fast, high quality |
+| Flux.2 Dev (FP8) | 40 GB | Flagship image gen |
 
 ## Documentation
 
@@ -238,12 +252,13 @@ MIT — See [LICENSE](LICENSE)
 
 ### v1.3.0
 
+- **Models now sourced from app-pack** — menus and `--run-all` matrix updated to exactly mirror `vllm_model_select.sh` and `ollama_model_select.sh` from `puget-docker-app-pack`; no more stale/guessed model lists
+- **vLLM models (9 entries):** Qwen 3.6 35B, Qwen 3.5 35B + 122B, DeepSeek R1 70B, Nemotron 3 Nano + Super (NVFP4), Gemma 4 26B, GPT-OSS 20B + 120B (MXFP4)
+- **Ollama models (6 entries):** Qwen 3.6 35B, DeepSeek R1 70B, Llama 4 Scout, Nemotron 3 Nano + Super, Gemma 4 31B
 - **Context window sweeps** — `--context-lengths 4096,32768,131072` benchmarks each size in a separate pass; results saved per `ctx{N}_concurrency_{C}` subdirectory
-- **FP4 (NVFP4) model variants** — Qwen3-8B-FP4 and Qwen3-32B-FP4 added to the vLLM menu and `--run-all` matrix, gated to Blackwell GPUs
-- **Latest models** — Qwen3-14B, Qwen3-30B-A3B (MoE), Qwen3-235B-A22B (MoE) added to vLLM and Ollama menus
 - **Cache fully wired for all packs** — `HF_ENDPOINT`, `HTTP_PROXY`, `HTTPS_PROXY` now injected into vLLM and Ollama `.env` files so the Squid proxy and HF mirror are actually used by the model containers
 - **Triton SDK image** updated to `25.04-py3-sdk`; `--sdk-image` override flag added to `run_genai_perf.sh`
-- **`HF_MIRROR` initialises to empty** before the `CACHE_PROXY` block to prevent unbound variable errors
+- **VRAM gates** match app-pack exactly; interactive prompt counts updated to 1-11 (vLLM) and 1-7 (Ollama)
 
 ### v1.2.0
 

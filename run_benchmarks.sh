@@ -427,43 +427,67 @@ get_vllm_model_info() {
 }
 
 define_run_all_matrix() {
-    # ── Team LLM models (vLLM) ─────────────────────────────────────────
-    # BF16 / FP8 baseline (runs on any GPU)
-    TEST_MATRIX+=("team_llm|1|Qwen3-8B|16||1")
-    if [ "$TOTAL_VRAM" -ge 24 ]; then
-        TEST_MATRIX+=("team_llm|3|Qwen3-14B|24||$CONCURRENCY")
+    # ── Team LLM (vLLM) — mirrors app-pack vllm_model_select.sh choices 1-9 ───
+    # Choice 1: Qwen 3.6 35B MoE AWQ — always available (22 GB)
+    TEST_MATRIX+=("team_llm|1|Qwen3.6-35B-A3B-AWQ|22||$CONCURRENCY")
+
+    # Choice 2: Qwen 3.5 35B MoE AWQ (22 GB)
+    if [ "$TOTAL_VRAM" -ge 22 ]; then
+        TEST_MATRIX+=("team_llm|2|Qwen3.5-35B-A3B-AWQ|22||$CONCURRENCY")
     fi
-    if [ "$TOTAL_VRAM" -ge 24 ]; then
-        TEST_MATRIX+=("team_llm|4|Qwen3-30B-A3B|24||$CONCURRENCY")  # MoE — low active params
-    fi
-    if [ "$TOTAL_VRAM" -ge 40 ]; then
-        TEST_MATRIX+=("team_llm|2|Qwen3-32B-FP8|40||$CONCURRENCY")
-    fi
+
+    # Choice 3: Qwen 3.5 122B MoE AWQ (80 GB)
     if [ "$TOTAL_VRAM" -ge 80 ]; then
-        TEST_MATRIX+=("team_llm|5|Qwen3-235B-A22B|80||$CONCURRENCY")  # MoE flagship
+        TEST_MATRIX+=("team_llm|3|Qwen3.5-122B-A10B-AWQ|80||$CONCURRENCY")
     fi
 
-    # NVFP4 variants — Blackwell only (GB200, RTX PRO 6000 Blackwell, etc.)
-    if [ "$IS_BLACKWELL" = "true" ]; then
-        TEST_MATRIX+=("team_llm|6|Qwen3-8B-FP4|16||$CONCURRENCY")
-        if [ "$TOTAL_VRAM" -ge 40 ]; then
-            TEST_MATRIX+=("team_llm|7|Qwen3-32B-FP4|40||$CONCURRENCY")
-        fi
+    # Choice 4: DeepSeek R1 70B AWQ (40 GB)
+    if [ "$TOTAL_VRAM" -ge 40 ]; then
+        TEST_MATRIX+=("team_llm|4|DeepSeek-R1-70B-AWQ|40||$CONCURRENCY")
     fi
 
-    # ── Personal LLM models (Ollama) ───────────────────────────────────
-    TEST_MATRIX+=("personal_llm|0|qwen3:8b|8|qwen3:8b|1")
-    if [ "$TOTAL_VRAM" -ge 12 ]; then
-        TEST_MATRIX+=("personal_llm|0|qwen3:14b|12|qwen3:14b|1")
+    # Choice 5: Nemotron 3 Nano 30B NVFP4 (20 GB)
+    TEST_MATRIX+=("team_llm|5|Nemotron3-Nano-30B-NVFP4|20||$CONCURRENCY")
+
+    # Choice 6: Nemotron 3 Super 120B NVFP4 (80 GB)
+    if [ "$TOTAL_VRAM" -ge 80 ]; then
+        TEST_MATRIX+=("team_llm|6|Nemotron3-Super-120B-NVFP4|80||$CONCURRENCY")
+    fi
+
+    # Choice 7: Gemma 4 26B MoE AWQ (20 GB)
+    if [ "$TOTAL_VRAM" -ge 20 ]; then
+        TEST_MATRIX+=("team_llm|7|Gemma4-26B-A4B-AWQ|20||$CONCURRENCY")
+    fi
+
+    # Choice 8: GPT-OSS 20B MXFP4 (16 GB)
+    TEST_MATRIX+=("team_llm|8|GPT-OSS-20B-MXFP4|16||$CONCURRENCY")
+
+    # Choice 9: GPT-OSS 120B MXFP4 (80 GB)
+    if [ "$TOTAL_VRAM" -ge 80 ]; then
+        TEST_MATRIX+=("team_llm|9|GPT-OSS-120B-MXFP4|80||$CONCURRENCY")
+    fi
+
+    # ── Personal LLM (Ollama) — mirrors app-pack ollama_model_select.sh ─────
+    if [ "$TOTAL_VRAM" -ge 24 ]; then
+        TEST_MATRIX+=("personal_llm|1|qwen3.6:35b|24|qwen3.6:35b|1")
+    fi
+    if [ "$TOTAL_VRAM" -ge 42 ]; then
+        TEST_MATRIX+=("personal_llm|2|deepseek-r1:70b|42|deepseek-r1:70b|1")
+    fi
+    if [ "$TOTAL_VRAM" -ge 63 ]; then
+        TEST_MATRIX+=("personal_llm|3|llama4:scout|63|llama4:scout|1")
+    fi
+    if [ "$TOTAL_VRAM" -ge 24 ]; then
+        TEST_MATRIX+=("personal_llm|4|nemotron-3-nano:30b|24|nemotron-3-nano:30b|1")
+    fi
+    if [ "$TOTAL_VRAM" -ge 96 ]; then
+        TEST_MATRIX+=("personal_llm|5|nemotron-3-super|96|nemotron-3-super|1")
     fi
     if [ "$TOTAL_VRAM" -ge 20 ]; then
-        TEST_MATRIX+=("personal_llm|0|qwen3:30b-a3b|20|qwen3:30b-a3b|1")
-    fi
-    if [ "$TOTAL_VRAM" -ge 32 ]; then
-        TEST_MATRIX+=("personal_llm|0|qwen3:32b|32|qwen3:32b|1")
+        TEST_MATRIX+=("personal_llm|6|gemma4:31b|20|gemma4:31b|1")
     fi
 
-    # ── ComfyUI image generation ────────────────────────────────────────
+    # ── ComfyUI image generation ──────────────────────────────────────
     if [ "$TOTAL_VRAM" -ge 16 ]; then
         TEST_MATRIX+=("comfy_ui|z_image_turbo|Z-Image Turbo|16||1")
     fi
@@ -536,23 +560,35 @@ download_if_missing() {
 }
 
 show_ollama_model_menu() {
-    echo "  1) Qwen3 (8B)            - Fast, Low VRAM (~5 GB)"
-    echo "  2) Qwen3 (14B)           - Balanced quality/speed (~9 GB)"
-    echo "  3) Qwen3 (30B-A3B)       - MoE: big model, small active params (~20 GB)"
+    if [ "$TOTAL_VRAM" -ge 24 ]; then
+        echo "  1) Qwen 3.6 (35B MoE)    - Agentic coding, 256K ctx, thinking preservation (~24 GB) [New]"
+    else
+        echo -e "  1) Qwen 3.6 (35B MoE)    - ${RED}Requires ~24 GB VRAM (you have ${TOTAL_VRAM} GB)${NC}"
+    fi
+    if [ "$TOTAL_VRAM" -ge 42 ]; then
+        echo "  2) DeepSeek R1 (70B)     - Flagship Reasoning, Dual GPU (~42 GB)"
+    else
+        echo -e "  2) DeepSeek R1 (70B)     - ${RED}Requires ~42 GB VRAM (you have ${TOTAL_VRAM} GB)${NC}"
+    fi
+    if [ "$TOTAL_VRAM" -ge 63 ]; then
+        echo "  3) Llama 4 Scout         - Multimodal (text+image), Dual GPU (~63 GB)"
+    else
+        echo -e "  3) Llama 4 Scout         - ${RED}Requires ~63 GB VRAM (you have ${TOTAL_VRAM} GB)${NC}"
+    fi
+    if [ "$TOTAL_VRAM" -ge 24 ]; then
+        echo "  4) Nemotron 3 Nano (30B) - NVIDIA MoE Reasoning, Single GPU (~24 GB)"
+    else
+        echo -e "  4) Nemotron 3 Nano (30B) - ${RED}Requires ~24 GB VRAM (you have ${TOTAL_VRAM} GB)${NC}"
+    fi
+    if [ "$TOTAL_VRAM" -ge 96 ]; then
+        echo "  5) Nemotron 3 Super      - NVIDIA Flagship MoE, Multi-GPU (~96 GB)"
+    else
+        echo -e "  5) Nemotron 3 Super      - ${RED}Requires ~96 GB VRAM (you have ${TOTAL_VRAM} GB)${NC}"
+    fi
     if [ "$TOTAL_VRAM" -ge 20 ]; then
-        echo "  4) Qwen3 (32B)           - Best single-GPU quality (~20 GB)"
+        echo "  6) Gemma 4 (31B)         - Google Dense Instruct, Single GPU (~20 GB)"
     else
-        echo -e "  4) Qwen3 (32B)           - ${RED}Requires ~20 GB VRAM${NC}"
-    fi
-    if [ "$TOTAL_VRAM" -ge 40 ]; then
-        echo "  5) DeepSeek R1 (70B)     - Flagship Reasoning, Dual GPU (~42 GB)"
-    else
-        echo -e "  5) DeepSeek R1 (70B)     - ${RED}Requires ~42 GB VRAM${NC}"
-    fi
-    if [ "$TOTAL_VRAM" -ge 80 ]; then
-        echo "  6) Qwen3 (235B-A22B)     - MoE flagship, high VRAM (~96 GB)"
-    else
-        echo -e "  6) Qwen3 (235B-A22B)     - ${RED}Requires ~96 GB VRAM${NC}"
+        echo -e "  6) Gemma 4 (31B)         - ${RED}Requires ~20 GB VRAM (you have ${TOTAL_VRAM} GB)${NC}"
     fi
     echo "  7) Custom tag            - Enter an Ollama model tag"
 }
@@ -560,15 +596,17 @@ show_ollama_model_menu() {
 select_ollama_model() {
     local choice="$1"
     OLLAMA_MODEL_TAG=""
+    OLLAMA_MODEL_VRAM_GB=0
     case $choice in
-        1) OLLAMA_MODEL_TAG="qwen3:8b" ;;
-        2) OLLAMA_MODEL_TAG="qwen3:14b" ;;
-        3) OLLAMA_MODEL_TAG="qwen3:30b-a3b" ;;
-        4) OLLAMA_MODEL_TAG="qwen3:32b" ;;
-        5) OLLAMA_MODEL_TAG="deepseek-r1:70b" ;;
-        6) OLLAMA_MODEL_TAG="qwen3:235b-a22b" ;;
+        1) OLLAMA_MODEL_TAG="qwen3.6:35b";        OLLAMA_MODEL_VRAM_GB=24 ;;
+        2) OLLAMA_MODEL_TAG="deepseek-r1:70b";    OLLAMA_MODEL_VRAM_GB=42 ;;
+        3) OLLAMA_MODEL_TAG="llama4:scout";        OLLAMA_MODEL_VRAM_GB=63 ;;
+        4) OLLAMA_MODEL_TAG="nemotron-3-nano:30b"; OLLAMA_MODEL_VRAM_GB=24 ;;
+        5) OLLAMA_MODEL_TAG="nemotron-3-super";    OLLAMA_MODEL_VRAM_GB=96 ;;
+        6) OLLAMA_MODEL_TAG="gemma4:31b";          OLLAMA_MODEL_VRAM_GB=20 ;;
         7)
             read -p "  Enter Ollama model tag: " OLLAMA_MODEL_TAG
+            OLLAMA_MODEL_VRAM_GB=0
             ;;
         *) return 1 ;;
     esac
@@ -648,9 +686,9 @@ else
             echo ""
             show_vllm_menu_remote
             echo ""
-            read -p "  Select [1-9]: " MODEL_CHOICE
-            if [[ "$MODEL_CHOICE" =~ ^[89]$ ]]; then
-                if [ "$MODEL_CHOICE" = "8" ]; then
+            read -p "  Select [1-11]: " MODEL_CHOICE
+            if [[ "$MODEL_CHOICE" =~ ^(10|11)$ ]]; then
+                if [ "$MODEL_CHOICE" = "10" ]; then
                     read -p "  Enter HuggingFace model ID: " CUSTOM_MODEL
                     TEST_MATRIX+=("team_llm|custom|${CUSTOM_MODEL}|0||${CONCURRENCY}")
                 else
@@ -667,7 +705,7 @@ else
             echo ""
             show_ollama_model_menu
             echo ""
-            read -p "  Select [1-6]: " MODEL_CHOICE
+            read -p "  Select [1-7]: " MODEL_CHOICE
             if select_ollama_model "$MODEL_CHOICE"; then
                 TEST_MATRIX+=("personal_llm|${MODEL_CHOICE}|${OLLAMA_MODEL_TAG}|0|${OLLAMA_MODEL_TAG}|1")
             else
