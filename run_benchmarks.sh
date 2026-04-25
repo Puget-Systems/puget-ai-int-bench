@@ -786,10 +786,24 @@ echo ""
 BENCH_COUNT=0
 BENCH_TOTAL=${#TEST_MATRIX[@]}
 FAILED_BENCHMARKS=()
+SUITE_START_EPOCH=$(date +%s)
+declare -a BENCH_TIMINGS=()
+
+format_duration() {
+    local secs=$1
+    local h=$((secs / 3600))
+    local m=$(( (secs % 3600) / 60 ))
+    local s=$((secs % 60))
+    if [ $h -gt 0 ]; then printf '%dh %02dm %02ds' $h $m $s
+    elif [ $m -gt 0 ]; then printf '%dm %02ds' $m $s
+    else printf '%ds' $s; fi
+}
 
 for entry in "${TEST_MATRIX[@]}"; do
     IFS='|' read -r BENCH_PACK BENCH_CHOICE BENCH_MODEL BENCH_MIN_VRAM BENCH_OLLAMA_TAG BENCH_CONCURRENCY <<< "$entry"
     BENCH_COUNT=$((BENCH_COUNT + 1))
+
+    _BENCH_START=$(date +%s)
 
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${BLUE}  Benchmark ${BENCH_COUNT}/${BENCH_TOTAL}: ${BENCH_PACK} → ${BENCH_MODEL}${NC}"
@@ -1033,7 +1047,13 @@ ENVEOF
 
         target_cmd "cd \"$COMFY_WORK_DIR\" && docker compose down 2>/dev/null"
     fi
+    _BENCH_ELAPSED=$(( $(date +%s) - _BENCH_START ))
+    BENCH_TIMINGS+=("${BENCH_PACK}|${BENCH_MODEL}|${_BENCH_ELAPSED}")
+    echo -e "  ${GREEN}⏱  ${BENCH_PACK} → ${BENCH_MODEL}: $(format_duration $_BENCH_ELAPSED)${NC}"
+    echo ""
 done
+
+SUITE_ELAPSED=$(( $(date +%s) - SUITE_START_EPOCH ))
 
 # ============================================
 # 6. Generate Consolidated Report
@@ -1049,6 +1069,15 @@ echo -e "${GREEN}==============================================================$
 echo -e "${GREEN}  Benchmarks Complete!${NC}"
 echo -e "${GREEN}==============================================================${NC}"
 echo "  Results: $MASTER_RESULTS_DIR"
+echo "  Total wall time: $(format_duration $SUITE_ELAPSED)"
+echo ""
+echo -e "${BLUE}  Per-benchmark timing:${NC}"
+printf '  %-15s %-35s %s\n' 'Pack' 'Model' 'Time'
+printf '  %-15s %-35s %s\n' '───────────────' '───────────────────────────────────' '──────────'
+for _t in "${BENCH_TIMINGS[@]}"; do
+    IFS='|' read -r _tp _tm _ts <<< "$_t"
+    printf '  %-15s %-35s %s\n' "$_tp" "$_tm" "$(format_duration $_ts)"
+done
 
 if [ ${#FAILED_BENCHMARKS[@]} -gt 0 ]; then
     echo ""
