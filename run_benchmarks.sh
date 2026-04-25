@@ -882,9 +882,21 @@ ENVEOF
 
         # For Gemma4: the Dockerfile.gemma4 bakes transformers>=5.5 into the image.
         # Without this build step, the stock vLLM image can't load Gemma4 weights.
+        # We build, tag as puget-vllm-gemma4:latest, then update .env to use it —
+        # compose's image: directive takes precedence over build: when the image exists.
         if echo "$BENCH_MODEL" | grep -qi "gemma.4"; then
             echo -e "  ${YELLOW}Building Gemma4-compatible vLLM image (transformers>=5.5)...${NC}"
-            target_cmd "cd \"$WORK_DIR\" && docker compose build inference"
+            target_cmd "cd \"$WORK_DIR\" && docker compose build inference && docker tag \$(docker compose images inference -q) puget-vllm-gemma4:latest"
+            target_cmd "sed -i 's|^VLLM_IMAGE=.*|VLLM_IMAGE=puget-vllm-gemma4:latest|' \"$WORK_DIR/.env\""
+        fi
+
+        # DeepSeek R1 70B: default 131K context needs 20 GB KV cache but only ~9 GB
+        # is available after weights. Cap to 60000 if not already set by the app-pack.
+        if echo "$BENCH_MODEL" | grep -qi "deepseek.*70b\|deepseek-r1-70b"; then
+            if ! target_cmd "grep -q '^MAX_CONTEXT=.' \"$WORK_DIR/.env\"" 2>/dev/null; then
+                echo -e "  ${YELLOW}Capping DeepSeek R1 70B MAX_CONTEXT to 60000 (KV cache limit)${NC}"
+                target_cmd "sed -i 's|^MAX_CONTEXT=$|MAX_CONTEXT=60000|' \"$WORK_DIR/.env\""
+            fi
         fi
 
         target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null; docker compose up -d"
@@ -945,6 +957,10 @@ ENVEOF
         fi
 
         echo ""
+        # Ollama model names (e.g. qwen3.6:35b) contain colons which are invalid
+        # HuggingFace repo IDs. genai-perf tries to auto-download the tokenizer
+        # from HF using the model name, which fails. We use the Ollama API model
+        # name as-is for the benchmark, but skip tokenizer-based metrics.
         if ! run_genai_perf_client "ollama" "${BENCH_URL_BASE}:11434" "$BENCH_OLLAMA_TAG" "$BENCH_CONCURRENCY" "$BENCH_RESULTS_DIR"; then
              echo -e "  ${RED}✗ genai-perf failed for ${BENCH_OLLAMA_TAG}${NC}"
              FAILED_BENCHMARKS+=("${BENCH_OLLAMA_TAG} (genai-perf failed)")

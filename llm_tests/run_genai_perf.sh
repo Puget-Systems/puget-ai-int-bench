@@ -48,6 +48,17 @@ if [ "$ENDPOINT" == "ollama" ]; then
             MODEL_NAME="llama3"  # Fallback
         fi
     fi
+    # Ollama model names (e.g. qwen3.6:35b) contain colons which are invalid
+    # HuggingFace repo IDs. Map to corresponding HF tokenizer for genai-perf.
+    case "$MODEL_NAME" in
+        qwen3.6*)       TOKENIZER_NAME="Qwen/Qwen3-30B-A3B" ;;
+        qwen3*)         TOKENIZER_NAME="Qwen/Qwen3-30B-A3B" ;;
+        deepseek-r1*)   TOKENIZER_NAME="deepseek-ai/DeepSeek-R1-Distill-Llama-70B" ;;
+        nemotron-3*)    TOKENIZER_NAME="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4" ;;
+        gemma4*)        TOKENIZER_NAME="google/gemma-3-27b-it" ;;
+        llama4*)        TOKENIZER_NAME="meta-llama/Llama-4-Scout-17B-16E-Instruct" ;;
+        *)              TOKENIZER_NAME="" ;;  # Let genai-perf try auto-resolve
+    esac
     echo "Configuring for Personal LLM (Ollama) at $URL"
 elif [ "$ENDPOINT" == "vllm" ]; then
     URL="${URL:-http://localhost:8000}"
@@ -110,6 +121,13 @@ for CTX in "${CTX_LIST[@]}"; do
         # Build a sub-dir per (context, concurrency) so results don't collide
         ARTIFACT_SUBDIR="ctx${CTX}_concurrency_${CONC}"
 
+        # Build tokenizer arg if we resolved a HF-compatible name
+        TOKENIZER_ARG=""
+        if [ -n "${TOKENIZER_NAME:-}" ]; then
+            TOKENIZER_ARG="--tokenizer $TOKENIZER_NAME"
+        fi
+
+        # shellcheck disable=SC2086
         docker run --rm --net=host \
             -e NVIDIA_DISABLE_REQUIRE=1 \
             -v "$RESULTS_DIR:/work/results" \
@@ -125,7 +143,8 @@ for CTX in "${CTX_LIST[@]}"; do
             --concurrency "$CONC" \
             --artifact-dir "results/${ARTIFACT_SUBDIR}" \
             --measurement-interval 120000 \
-            --stability-percentage 999
+            --stability-percentage 999 \
+            $TOKENIZER_ARG
 
         echo "  Done: concurrency=${CONC}, input_tokens=${CTX}"
     done
