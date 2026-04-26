@@ -882,12 +882,11 @@ ENVEOF
 
         # For Gemma4: the Dockerfile.gemma4 bakes transformers>=5.5 into the image.
         # Without this build step, the stock vLLM image can't load Gemma4 weights.
-        # We build, tag as puget-vllm-gemma4:latest, then update .env to use it —
-        # compose's image: directive takes precedence over build: when the image exists.
+        # docker compose build tags the result as the VLLM_IMAGE value from .env
+        # (cu130-nightly), so docker compose up will use the freshly-built image.
         if echo "$BENCH_MODEL" | grep -qi "gemma.4"; then
             echo -e "  ${YELLOW}Building Gemma4-compatible vLLM image (transformers>=5.5)...${NC}"
-            target_cmd "cd \"$WORK_DIR\" && docker compose build inference && docker tag \$(docker compose images inference -q) puget-vllm-gemma4:latest"
-            target_cmd "sed -i 's|^VLLM_IMAGE=.*|VLLM_IMAGE=puget-vllm-gemma4:latest|' \"$WORK_DIR/.env\""
+            target_cmd "cd \"$WORK_DIR\" && docker compose build inference"
         fi
 
         # DeepSeek R1 70B: default 131K context needs 20 GB KV cache but only ~9 GB
@@ -921,7 +920,9 @@ ENVEOF
             FAILED_BENCHMARKS+=("${BENCH_MODEL} (genai-perf failed)")
         fi
 
-        target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null"
+        target_cmd "cd \"$WORK_DIR\" && docker compose down -v 2>/dev/null"
+        # Prune per-benchmark volumes (open_webui_data) and dangling images to reclaim disk
+        target_cmd "docker volume prune -f 2>/dev/null; docker image prune -f 2>/dev/null" || true
 
     elif [ "$BENCH_PACK" = "personal_llm" ]; then
         target_cmd "cat > \"$WORK_DIR/.env\"" <<ENVEOF
@@ -966,7 +967,8 @@ ENVEOF
              FAILED_BENCHMARKS+=("${BENCH_OLLAMA_TAG} (genai-perf failed)")
         fi
 
-        target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null"
+        target_cmd "cd \"$WORK_DIR\" && docker compose down -v 2>/dev/null"
+        target_cmd "docker volume prune -f 2>/dev/null; docker image prune -f 2>/dev/null" || true
 
     elif [ "$BENCH_PACK" = "comfy_ui" ]; then
         # ── ComfyUI: pre-download models, build, launch, benchmark, teardown ──
