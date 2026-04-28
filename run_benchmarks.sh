@@ -799,6 +799,11 @@ format_duration() {
     else printf '%ds' $s; fi
 }
 
+echo -e "${YELLOW}Clearing shared benchmark caches for a fresh start...${NC}"
+target_cmd "docker run --rm -v shared_vllm_cache:/cache alpine rm -rf /cache/hub/*" 2>/dev/null || true
+target_cmd "docker run --rm -v shared_ollama_data:/data alpine rm -rf /data/*" 2>/dev/null || true
+target_cmd "docker volume prune -f 2>/dev/null; docker image prune -f 2>/dev/null" || true
+
 for entry in "${TEST_MATRIX[@]}"; do
     IFS='|' read -r BENCH_PACK BENCH_CHOICE BENCH_MODEL BENCH_MIN_VRAM BENCH_OLLAMA_TAG BENCH_CONCURRENCY <<< "$entry"
     BENCH_COUNT=$((BENCH_COUNT + 1))
@@ -893,8 +898,8 @@ ENVEOF
         # is available after weights. Cap to 60000 if not already set by the app-pack.
         if echo "$BENCH_MODEL" | grep -qi "deepseek.*70b\|deepseek-r1-70b"; then
             if ! target_cmd "grep -q '^MAX_CONTEXT=.' \"$WORK_DIR/.env\"" 2>/dev/null; then
-                echo -e "  ${YELLOW}Capping DeepSeek R1 70B MAX_CONTEXT to 60000 (KV cache limit)${NC}"
-                target_cmd "sed -i 's|^MAX_CONTEXT=$|MAX_CONTEXT=60000|' \"$WORK_DIR/.env\""
+                echo -e "  ${YELLOW}Capping DeepSeek R1 70B MAX_CONTEXT to 55000 (KV cache limit)${NC}"
+                target_cmd "sed -i 's|^MAX_CONTEXT=$|MAX_CONTEXT=55000|' \"$WORK_DIR/.env\""
             fi
         fi
 
@@ -921,6 +926,10 @@ ENVEOF
         fi
 
         target_cmd "cd \"$WORK_DIR\" && docker compose down -v 2>/dev/null"
+        # Prune specific model from shared cache to save disk (Prune-as-you-go)
+        HF_CACHE_DIR="models--$(echo "$BENCH_MODEL" | sed 's/\//--/g')"
+        echo -e "  ${BLUE}Pruning $BENCH_MODEL from shared vLLM cache...${NC}"
+        target_cmd "docker run --rm -v shared_vllm_cache:/cache alpine rm -rf \"/cache/hub/$HF_CACHE_DIR\"" 2>/dev/null || true
         # Prune per-benchmark volumes (open_webui_data) and dangling images to reclaim disk
         target_cmd "docker volume prune -f 2>/dev/null; docker image prune -f 2>/dev/null" || true
 
@@ -966,6 +975,10 @@ ENVEOF
              echo -e "  ${RED}✗ genai-perf failed for ${BENCH_OLLAMA_TAG}${NC}"
              FAILED_BENCHMARKS+=("${BENCH_OLLAMA_TAG} (genai-perf failed)")
         fi
+
+        # Prune specific model from Ollama to save disk
+        echo -e "  ${BLUE}Pruning $BENCH_OLLAMA_TAG from shared Ollama data...${NC}"
+        target_cmd "docker exec puget_ollama ollama rm \"$BENCH_OLLAMA_TAG\"" 2>/dev/null || true
 
         target_cmd "cd \"$WORK_DIR\" && docker compose down -v 2>/dev/null"
         target_cmd "docker volume prune -f 2>/dev/null; docker image prune -f 2>/dev/null" || true
@@ -1063,7 +1076,11 @@ ENVEOF
             FAILED_BENCHMARKS+=("${BENCH_MODEL} (benchmark failed)")
         fi
 
-        target_cmd "cd \"$COMFY_WORK_DIR\" && docker compose down 2>/dev/null"
+        target_cmd "cd \"$COMFY_WORK_DIR\" && docker compose down -v 2>/dev/null"
+        # Prune ComfyUI models (they are stored in the work dir)
+        echo -e "  ${BLUE}Pruning ComfyUI models for ${BENCH_CHOICE}...${NC}"
+        target_cmd "rm -rf \"$COMFY_WORK_DIR\"" 2>/dev/null || true
+        target_cmd "docker image prune -f 2>/dev/null" || true
     fi
     _BENCH_ELAPSED=$(( $(date +%s) - _BENCH_START ))
     BENCH_TIMINGS+=("${BENCH_PACK}|${BENCH_MODEL}|${_BENCH_ELAPSED}")
