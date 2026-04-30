@@ -144,19 +144,42 @@ run_genai_perf_client() {
     local concurrency="$4"
     local results_dir="$5"
 
-    echo -e "  ${BLUE}Running genai-perf benchmark locally pointed at ${url}...${NC}"
+    local port
+    port=$(echo "$url" | grep -o ':[0-9]*$' | tr -d ':')
+    
+    # Find a random available local port for the tunnel
+    local local_port
+    while true; do
+        local_port=$((10000 + RANDOM % 10000))
+        if ! nc -z 127.0.0.1 $local_port 2>/dev/null; then
+            break
+        fi
+    done
+
+    echo -e "  ${BLUE}Starting SSH tunnel for genai-perf (local port $local_port -> remote $port)...${NC}"
+    # Start SSH tunnel in background
+    ssh -f -N -L "$local_port:127.0.0.1:$port" "${SSH_OPTS[@]}" "$HOST"
+    
+    # Give the tunnel a second to establish
+    sleep 1
+    
+    local tunnel_pid
+    tunnel_pid=$(lsof -t -i:$local_port | head -1)
+
+    echo -e "  ${BLUE}Running genai-perf benchmark locally pointed at host.docker.internal:${local_port}...${NC}"
 
     local ctx_arg=""
     if [ -n "${CONTEXT_LENGTHS:-}" ]; then
         ctx_arg="--context-lengths ${CONTEXT_LENGTHS}"
     fi
 
+    local exit_code=0
     (
         cd "$SCRIPT_DIR/llm_tests"
         # shellcheck disable=SC2086
         ./run_genai_perf.sh \
             --endpoint "$endpoint" \
-            --url "$url" \
+            --url "http://host.docker.internal:$local_port" \
             --model "$model" \
             --concurrency "$concurrency" \
             --input-tokens "$INPUT_TOKENS" \
@@ -164,7 +187,14 @@ run_genai_perf_client() {
             --num-prompts "$NUM_PROMPTS" \
             --results-dir "$results_dir" \
             $ctx_arg
-    )
+    ) || exit_code=$?
+
+    echo -e "  ${BLUE}Closing SSH tunnel...${NC}"
+    if [ -n "$tunnel_pid" ]; then
+        kill -9 "$tunnel_pid" 2>/dev/null || true
+    fi
+
+    return $exit_code
 }
 
 echo -e "${BLUE}==============================================================${NC}"
@@ -293,8 +323,8 @@ echo -e "${YELLOW}[1/6] Acquiring App Pack repository on remote server...${NC}"
 REMOTE_TEMP_DIR=$(target_cmd "mktemp -d")
 cleanup() {
     echo ""
-    echo -e "${DIM}Cleaning up remote temp directory...${NC}"
-    target_cmd "rm -rf $REMOTE_TEMP_DIR" >/dev/null 2>&1 || true
+    echo -e "${YELLOW}Cleaning up remote temp directory...${NC}"
+# target_cmd "rm -rf \"$REMOTE_TEMP_DIR\"" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -323,6 +353,9 @@ fi
 echo -e "${GREEN}✓ Repository deployed to $REMOTE_TEMP_DIR/app-pack.${NC}"
 
 PACK_ROOT="$REMOTE_TEMP_DIR/app-pack"
+
+# Temporary fix for Gemma 4 Dockerfile missing git
+target_cmd "sed -i '/RUN pip install --no-cache-dir/i RUN apt-get update && apt-get install -y git' \"$PACK_ROOT/packs/team_llm/Dockerfile.gemma4\""
 
 # ============================================
 # 2. Integrity Check (MD5) - Remote
@@ -387,7 +420,7 @@ if [ -n "$CACHE_PROXY" ]; then
         # Derive HF mirror URL from proxy host (port 8090 = puget_hf_mirror)
         HF_MIRROR="http://${_PROXY_HOST}:8090"
         # Verify the mirror is reachable
-        if target_cmd "curl -sf --max-time 3 '${HF_MIRROR}/api/whoami' > /dev/null 2>&1"; then
+        if target_cmd "curl -s --max-time 3 '${HF_MIRROR}/api/whoami' > /dev/null 2>&1"; then
             echo -e "${GREEN}✓ HF Mirror: ${HF_MIRROR} (model downloads will be cached)${NC}"
         else
             HF_MIRROR=""
@@ -885,13 +918,18 @@ ENVEOF
         _OVERRIDE+="volumes:\n  vllm_cache:\n    external: true\n    name: shared_vllm_cache\n"
         target_cmd "printf '${_OVERRIDE}' > \"${WORK_DIR}/docker-compose.override.yml\""
 
-        # For Gemma4: the Dockerfile.gemma4 bakes transformers>=5.5 into the image.
-        # Without this build step, the stock vLLM image can't load Gemma4 weights.
-        # docker compose build tags the result as the VLLM_IMAGE value from .env
-        # (cu130-nightly), so docker compose up will use the freshly-built image.
+        # Gemma4 AWQ: upstream vLLM lacks packed-expert weight support.
+        # The model crashes with KeyError: 'layers.0.moe.experts.0.down_proj_packed'.
+        # Skip gracefully until vLLM adds support.
         if echo "$BENCH_MODEL" | grep -qi "gemma.4"; then
-            echo -e "  ${YELLOW}Building Gemma4-compatible vLLM image (transformers>=5.5)...${NC}"
-            target_cmd "cd \"$WORK_DIR\" && docker compose build inference"
+            echo -e "  ${YELLOW}⚠ Gemma4 AWQ is currently unsupported by vLLM (packed-expert weights).${NC}"
+            echo -e "  ${YELLOW}  Skipping benchmark. See: https://github.com/vllm-project/vllm/issues/${NC}"
+            echo "SKIPPED: Gemma4 AWQ — upstream vLLM lacks packed-expert weight support" > "$BENCH_RESULTS_DIR/SKIPPED.txt"
+            FAILED_BENCHMARKS+=("${BENCH_MODEL} (unsupported — vLLM packed experts)")
+            _BENCH_ELAPSED=$(( $(date +%s) - _BENCH_START ))
+            BENCH_TIMINGS+=("${BENCH_PACK}|${BENCH_MODEL}|${_BENCH_ELAPSED}")
+            echo -e "  ${GREEN}⏱  ${BENCH_PACK} → ${BENCH_MODEL}: $(format_duration $_BENCH_ELAPSED)${NC}"
+            continue
         fi
 
         # DeepSeek R1 70B: default 131K context needs 20 GB KV cache but only ~9 GB
@@ -911,8 +949,8 @@ ENVEOF
 
         if ! target_cmd "curl -s --max-time 5 http://localhost:8000/v1/models > /dev/null 2>&1"; then
             echo -e "  ${RED}✗ vLLM API not responding. Skipping.${NC}"
-            target_cmd "cd \"$WORK_DIR\" && docker compose logs --tail 20"
-            target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null"
+            target_cmd "cd \"$WORK_DIR\" && docker compose logs --tail 200"
+            # target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null"
             FAILED_BENCHMARKS+=("$BENCH_MODEL (vLLM failed)")
             continue
         fi
@@ -922,6 +960,8 @@ ENVEOF
         echo ""
         if ! run_genai_perf_client "vllm" "${BENCH_URL_BASE}:8000" "$API_MODEL" "$BENCH_CONCURRENCY" "$BENCH_RESULTS_DIR"; then
             echo -e "  ${RED}✗ genai-perf failed for ${BENCH_MODEL}${NC}"
+            echo -e "  ${YELLOW}Capturing vLLM logs for debugging...${NC}"
+            target_cmd "cd \"$WORK_DIR\" && docker compose logs --tail 200 > /tmp/vllm_error_${BENCH_MODEL//\//_}.log"
             FAILED_BENCHMARKS+=("${BENCH_MODEL} (genai-perf failed)")
         fi
 
@@ -947,6 +987,10 @@ ENVEOF
         target_cmd "docker volume create shared_ollama_data 2>/dev/null || true"
         _OL_OVERRIDE="volumes:\n  ollama_data:\n    external: true\n    name: shared_ollama_data\n"
         target_cmd "printf '${_OL_OVERRIDE}' > \"${WORK_DIR}/docker-compose.override.yml\""
+        # Pull the latest Ollama image before starting — prevents 412 manifest
+        # errors when pulling newer models that require a newer Ollama version.
+        echo -e "  ${BLUE}Pulling latest Ollama container image...${NC}"
+        target_cmd "cd \"$WORK_DIR\" && docker compose pull" 2>/dev/null || true
         target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null; docker compose up -d"
 
         echo -e "  ${YELLOW}Waiting for Ollama API...${NC}"
@@ -966,6 +1010,16 @@ ENVEOF
              continue
         fi
 
+        # Pre-load the model into GPU VRAM before benchmarking.
+        # Large models (e.g. 35B) can take 30+ seconds to load on first request,
+        # which causes perf_analyzer to time out. This warm-up call ensures the
+        # model is fully loaded and ready for inference.
+        echo -e "  ${BLUE}Pre-loading model into VRAM...${NC}"
+        if ! target_cmd "curl -sf --max-time 120 http://localhost:11434/api/generate -d '{\"model\": \"${BENCH_OLLAMA_TAG}\", \"keep_alive\": \"30m\"}' > /dev/null 2>&1"; then
+            echo -e "  ${YELLOW}⚠ Model pre-load timed out, continuing anyway...${NC}"
+        fi
+        echo -e "  ${GREEN}✓ Model loaded and ready${NC}"
+
         echo ""
         # Ollama model names (e.g. qwen3.6:35b) contain colons which are invalid
         # HuggingFace repo IDs. genai-perf tries to auto-download the tokenizer
@@ -973,6 +1027,7 @@ ENVEOF
         # name as-is for the benchmark, but skip tokenizer-based metrics.
         if ! run_genai_perf_client "ollama" "${BENCH_URL_BASE}:11434" "$BENCH_OLLAMA_TAG" "$BENCH_CONCURRENCY" "$BENCH_RESULTS_DIR"; then
              echo -e "  ${RED}✗ genai-perf failed for ${BENCH_OLLAMA_TAG}${NC}"
+             target_cmd "cd \"$WORK_DIR\" && docker compose logs --tail 200 > /tmp/ollama_error_${BENCH_MODEL//\//_}.log"
              FAILED_BENCHMARKS+=("${BENCH_OLLAMA_TAG} (genai-perf failed)")
         fi
 
@@ -1056,7 +1111,7 @@ ENVEOF
         echo -e "  ${BLUE}Starting ComfyUI on remote server...${NC}"
         # Fix ownership on volume-mount dirs (container runs as UID 999, GID 1500)
         target_cmd "mkdir -p \"$COMFY_WORK_DIR/output\" \"$COMFY_WORK_DIR/input\" \"$COMFY_WORK_DIR/custom_nodes\""
-        target_cmd "chmod -R 775 \"$COMFY_WORK_DIR/output\" \"$COMFY_WORK_DIR/input\" 2>/dev/null || true"
+        target_cmd "chmod -R 777 \"$COMFY_WORK_DIR/output\" \"$COMFY_WORK_DIR/input\" 2>/dev/null || true"
         target_cmd "cd \"$COMFY_WORK_DIR\" && docker compose down 2>/dev/null; docker compose up -d"
 
         # Wait for API (port 8188)

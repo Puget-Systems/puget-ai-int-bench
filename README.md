@@ -14,8 +14,9 @@ Fully automated performance benchmarking for [Puget Docker App Packs](https://gi
 
 | Requirement | Notes |
 |---|---|
-| **Docker** | With NVIDIA Container Toolkit |
-| **NVIDIA GPU + Drivers** | `nvidia-smi` must work |
+| **Docker** | With NVIDIA Container Toolkit (on GPU host) |
+| **Docker Desktop** | On the Mac orchestrator (for local genai-perf + ComfyUI clients) |
+| **NVIDIA GPU + Drivers** | `nvidia-smi` must work on remote host |
 | **Git** | For cloning the App Pack repository |
 | **Python 3** | For summary report + ComfyUI benchmark client |
 
@@ -119,35 +120,36 @@ Additional infrastructure caching:
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  run_benchmarks.sh                                                   │
-│                                                                      │
-│  1. git clone puget-docker-app-pack → /tmp (MD5 verified)           │
-│  2. Source shared libs (gpu_detect, vllm_model_select, etc.)        │
-│  3. For each (pack, model) in test matrix:                           │
-│                                                                      │
-│     LLM packs (team_llm / personal_llm):                            │
-│     ┌──────────────────────────────────────────┐                     │
-│     │  Write .env (model, cache proxy)         │                     │
-│     │  docker compose up -d                    │                     │
-│     │  Wait for API health                     │ ← vllm_monitor.sh  │
-│     │  genai-perf benchmark                    │ ← run_genai_perf.sh│
-│     │  docker compose down                     │                     │
-│     └──────────────────────────────────────────┘                     │
-│                                                                      │
-│     ComfyUI pack (comfy_ui):                                        │
-│     ┌──────────────────────────────────────────┐                     │
-│     │  Pre-download models (3-tier cache)       │                     │
-│     │  Install MultiGPU extension (if needed)  │                     │
-│     │  docker compose build + up -d            │ ← smart_build.sh   │
-│     │  Wait for API (:8188)                    │                     │
-│     │  Python bench client (REST + WebSocket)  │ ← run_comfyui_bench│
-│     │  docker compose down                     │                     │
-│     └──────────────────────────────────────────┘                     │
-│                                                                      │
-│  4. generate_summary.py → summary.txt + summary.md                  │
-└──────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Mac Orchestrator (run_benchmarks.sh)                                   │
+│                                                                         │
+│  1. git clone puget-docker-app-pack → remote /tmp (MD5 verified)       │
+│  2. Source shared libs (gpu_detect, vllm_model_select, etc.)           │
+│  3. For each (pack, model) in test matrix:                              │
+│                                                                         │
+│     LLM packs (team_llm / personal_llm):                               │
+│     ┌────────────────────────────────────────────────────────┐          │
+│     │  Remote: Write .env → docker compose up -d            │          │
+│     │  Remote: Wait for API health (vllm_monitor.sh via SSH)│          │
+│     │  Local:  SSH tunnel (localhost:PORT → remote:8000)     │ ← NEW   │
+│     │  Local:  genai-perf container → host.docker.internal  │          │
+│     │  Remote: docker compose down                          │          │
+│     └────────────────────────────────────────────────────────┘          │
+│                                                                         │
+│     ComfyUI pack (comfy_ui):                                           │
+│     ┌────────────────────────────────────────────────────────┐          │
+│     │  Remote: Pre-download models (3-tier cache)            │          │
+│     │  Remote: Install MultiGPU extension (if needed)       │          │
+│     │  Remote: docker compose build + up -d (smart_build.sh)│          │
+│     │  Local:  Python bench client (REST + WebSocket)       │          │
+│     │  Remote: docker compose down                          │          │
+│     └────────────────────────────────────────────────────────┘          │
+│                                                                         │
+│  4. generate_summary.py → summary.txt + summary.md                     │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
+
+> **Note:** genai-perf runs **locally** on the Mac inside a Triton SDK container. An SSH port-forward tunnel maps a random local port to the remote inference server's API (port 8000/11434). The container reaches the tunnel via `host.docker.internal`. This keeps the GPU node's resources fully dedicated to inference and bypasses macOS Docker's VPN network isolation.
 
 ## Benchmark Parameters
 
@@ -240,15 +242,26 @@ See [`findings/`](findings/) for detailed results and analysis.
 
 ## Known Issues
 
+- **Gemma 4 + vLLM:** Blocked upstream — vLLM does not yet support packed MoE expert weights. Auto-skipped by the orchestrator. Use the Ollama `gemma4:31b` variant instead.
 - **vLLM + GB10:** NVFP4 MoE kernels crash at concurrency > 1 on sm_120 architecture. Use Ollama as a workaround.
 - **Ollama silent CPU fallback:** If Docker loses GPU context (e.g., after VM suspend/resume), Ollama falls back to CPU without warning. Fix: `docker compose down && docker compose up -d`.
 - **Triton SDK on GB10:** Emits a harmless "unsupported GPU" warning. Benchmarks work fine — genai-perf only uses CPU for HTTP request generation.
+- **macOS VPN isolation:** Docker Desktop on macOS cannot use `--net=host`, so containers cannot reach VPN-only hosts directly. The orchestrator works around this with SSH port-forwarding tunnels.
 
 ## License
 
 MIT — See [LICENSE](LICENSE)
 
 ## Changelog
+
+### v1.4.0
+
+- **Local genai-perf execution via SSH tunnel** — genai-perf now runs locally on macOS inside a Triton SDK container, connecting to the remote inference server via a dynamic SSH port-forward (`localhost:RANDOM → remote:8000`). This keeps the GPU node's resources fully dedicated to inference and bypasses macOS Docker's VPN network namespace isolation.
+- **Docker Desktop required** — the Mac orchestrator now needs Docker Desktop running locally for genai-perf and ComfyUI benchmark containers.
+- **HF Mirror detection fix** — the mirror health check no longer uses `curl -f`, which was incorrectly failing on a valid `401 Unauthorized` response from the HuggingFace mirror proxy.
+- **Gemma 4 / vLLM auto-skip** — `Gemma4-26B-A4B-AWQ` is automatically skipped with a diagnostic message, pending upstream vLLM support for packed MoE expert weights.
+- **Mandatory Ollama pre-loading** — uses `/api/generate` with `keep_alive` to force model load before benchmarking, preventing timeout failures.
+- **Automated `docker compose pull`** — Ollama images are pulled before each run to prevent HTTP 412 manifest versioning errors.
 
 ### v1.3.0
 

@@ -57,7 +57,9 @@ if [ "$ENDPOINT" == "ollama" ]; then
         nemotron-3*)    TOKENIZER_NAME="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4" ;;
         gemma4*)        TOKENIZER_NAME="google/gemma-3-27b-it" ;;
         llama4*)        TOKENIZER_NAME="meta-llama/Llama-4-Scout-17B-16E-Instruct" ;;
-        *)              TOKENIZER_NAME="" ;;  # Let genai-perf try auto-resolve
+        llama3.2*)      TOKENIZER_NAME="meta-llama/Llama-3.2-1B" ;;
+        llama3*)        TOKENIZER_NAME="meta-llama/Llama-3.1-8B" ;;
+        *)              TOKENIZER_NAME="HuggingFaceTB/SmolLM-135M" ;;  # Safe fallback
     esac
     echo "Configuring for Personal LLM (Ollama) at $URL"
 elif [ "$ENDPOINT" == "vllm" ]; then
