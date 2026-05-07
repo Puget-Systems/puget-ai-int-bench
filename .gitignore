@@ -4,3 +4,5 @@ llm_tests/__pycache__/
 bench.conf
 .DS_Store
 .venv/
+nohup.out
+*.log
