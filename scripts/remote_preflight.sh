@@ -26,9 +26,17 @@ if [ -z "${SUDO_PASS:-}" ]; then
     exit 1
 fi
 
-# Prime sudo credentials cache so subsequent sudo calls don't need -S
-echo "$SUDO_PASS" | sudo -S true 2>/dev/null
-# From this point on, just use plain `sudo` — credentials are cached
+# Verify the password works
+if ! echo "$SUDO_PASS" | command sudo -S true 2>/dev/null; then
+    echo -e "${RED}✗ sudo password is incorrect.${NC}"
+    exit 1
+fi
+
+# Wrap sudo so every call gets the password via stdin.
+# The SSH session has no TTY, so sudo credential caching doesn't work.
+sudo() {
+    echo "$SUDO_PASS" | command sudo -S "$@" 2>&1 | grep -v '^\[sudo\]'
+}
 
 NEEDS_REBOOT=false
 

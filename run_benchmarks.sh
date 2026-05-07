@@ -51,6 +51,7 @@ COMFY_ITERATIONS=10
 CONTEXT_LENGTHS=""  # e.g. "4096,32768,131072" — empty = use INPUT_TOKENS only
 SKIP_CHECKSUM=false
 HF_TOKEN=""         # HuggingFace token — load from bench.conf or --hf-token flag
+SUDO_PASS=""        # Remote sudo password — load from bench.conf or --sudo-pass flag
 
 # ============================================
 # Load Config File (if exists)
@@ -88,6 +89,7 @@ while [[ "$#" -gt 0 ]]; do
         --context-lengths) CONTEXT_LENGTHS="$2"; shift ;;
         --skip-checksum) SKIP_CHECKSUM=true ;;
         --hf-token) HF_TOKEN="$2"; shift ;;
+        --sudo-pass) SUDO_PASS="$2"; shift ;;
         -h|--help)
             echo -e "${BLUE}Puget Systems AI App Pack — Automated Benchmark Suite${NC}"
             echo ""
@@ -244,9 +246,14 @@ if [ "$NEED_PREFLIGHT" = true ]; then
         exit 1
     fi
 
-    # Ask for sudo password locally (only once)
-    read -s -p "  Enter sudo password for remote server ($HOST): " REMOTE_SUDO_PASS
-    echo ""
+    # Use SUDO_PASS from bench.conf / --sudo-pass flag, or prompt interactively
+    if [ -n "$SUDO_PASS" ]; then
+        REMOTE_SUDO_PASS="$SUDO_PASS"
+        echo -e "  ${GREEN}Using sudo password from config.${NC}"
+    else
+        read -s -p "  Enter sudo password for remote server ($HOST): " REMOTE_SUDO_PASS
+        echo ""
+    fi
 
     # Pass the password via heredoc stdin to avoid exposure in ps output
     run_preflight() {

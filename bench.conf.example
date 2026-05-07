@@ -12,3 +12,6 @@ CACHE_PROXY=http://CACHE_PROXY_IP:3128
 
 # Default concurrency levels for vLLM benchmarks
 # CONCURRENCY=1,4,8,16
+
+# Sudo password for remote server (teardown/lab machines only)
+# SUDO_PASS=[PASSWORD]
