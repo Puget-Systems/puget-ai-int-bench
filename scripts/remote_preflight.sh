@@ -32,10 +32,22 @@ if ! echo "$SUDO_PASS" | command sudo -S true 2>/dev/null; then
     exit 1
 fi
 
-# Wrap sudo so every call gets the password via stdin.
-# The SSH session has no TTY, so sudo credential caching doesn't work.
+# Set up SUDO_ASKPASS so sudo can get the password without consuming stdin.
+# The stdin-pipe approach (echo PASS | sudo -S cmd) breaks commands like
+# "curl ... | sudo gpg --dearmor" where sudo's child needs its own stdin.
+_ASKPASS=$(mktemp)
+chmod 700 "$_ASKPASS"
+cat > "$_ASKPASS" <<'ASKEOF'
+#!/bin/bash
+echo "$SUDO_PASS"
+ASKEOF
+# Re-export so the askpass script inherits it
+export SUDO_PASS
+export SUDO_ASKPASS="$_ASKPASS"
+
+# Wrap sudo to always use -A (askpass) instead of -S (stdin)
 sudo() {
-    echo "$SUDO_PASS" | command sudo -S "$@" 2>&1 | sed '/^\[sudo\]/d'
+    command sudo -A "$@"
 }
 
 NEEDS_REBOOT=false
