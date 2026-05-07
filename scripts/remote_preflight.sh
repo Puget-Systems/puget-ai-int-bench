@@ -35,7 +35,7 @@ fi
 # Wrap sudo so every call gets the password via stdin.
 # The SSH session has no TTY, so sudo credential caching doesn't work.
 sudo() {
-    echo "$SUDO_PASS" | command sudo -S "$@" 2>&1 | grep -v '^\[sudo\]'
+    echo "$SUDO_PASS" | command sudo -S "$@" 2>&1 | sed '/^\[sudo\]/d'
 }
 
 NEEDS_REBOOT=false
