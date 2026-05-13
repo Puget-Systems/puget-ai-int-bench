@@ -52,6 +52,7 @@ CONTEXT_LENGTHS=""  # e.g. "4096,32768,131072" — empty = use INPUT_TOKENS only
 SKIP_CHECKSUM=false
 HF_TOKEN=""         # HuggingFace token — load from bench.conf or --hf-token flag
 SUDO_PASS=""        # Remote sudo password — load from bench.conf or --sudo-pass flag
+NO_LOCAL_DOCKER=false  # Set by local preflight if Docker is unavailable
 
 # ============================================
 # Load Config File (if exists)
@@ -217,6 +218,100 @@ if [ "$DRY_RUN" = true ]; then
     echo ""
     echo -e "${YELLOW}⚠  DRY RUN MODE — no containers will be launched${NC}"
     echo ""
+fi
+
+# ============================================
+# 0.25. Local Preflight — Docker (needed for genai-perf)
+# ============================================
+# genai-perf runs inside a local Triton SDK container, so Docker must be
+# available on the machine executing this script.  ComfyUI benchmarks use
+# Python/curl and do NOT require local Docker.
+if ! command -v docker &>/dev/null; then
+    echo ""
+    echo -e "${YELLOW}[0.25/6] Local Docker check...${NC}"
+    echo -e "${RED}✗ Docker is not installed on this machine.${NC}"
+    echo ""
+    echo "  LLM benchmarks (team_llm / personal_llm) require Docker locally"
+    echo "  to run the genai-perf benchmark client."
+    echo ""
+
+    LOCAL_OS="$(uname -s)"
+    case "$LOCAL_OS" in
+        Darwin)
+            echo "  Install Docker Desktop for macOS:"
+            echo "    https://docs.docker.com/desktop/setup/install/mac-install/"
+            echo ""
+            echo "  Or via Homebrew:"
+            echo "    brew install --cask docker"
+            echo ""
+            echo "  After installing, launch Docker Desktop and wait for it to start."
+            ;;
+        Linux)
+            # Detect WSL
+            if grep -qi microsoft /proc/version 2>/dev/null; then
+                echo "  You appear to be running WSL. Install Docker Desktop for Windows"
+                echo "  with WSL2 backend enabled:"
+                echo "    https://docs.docker.com/desktop/setup/install/windows-install/"
+                echo ""
+                echo "  Make sure 'Use the WSL 2 based engine' is checked in Docker Desktop"
+                echo "  settings, and your distro is enabled under Resources → WSL Integration."
+            else
+                echo "  Install Docker on Linux:"
+                echo ""
+                read -p "  Would you like to install Docker CE now? [y/N] " INSTALL_DOCKER
+                if [[ "$INSTALL_DOCKER" =~ ^[Yy] ]]; then
+                    echo ""
+                    echo -e "${BLUE}  Installing Docker CE...${NC}"
+                    sudo apt-get update -y
+                    sudo apt-get install -y ca-certificates curl gnupg
+                    sudo install -m 0755 -d /etc/apt/keyrings
+                    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --yes --dearmor -o /etc/apt/keyrings/docker.gpg
+                    sudo chmod a+r /etc/apt/keyrings/docker.gpg
+                    echo \
+                      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+                      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+                      sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+                    sudo apt-get update -y
+                    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+                    sudo usermod -aG docker "$USER"
+                    echo ""
+                    echo -e "${GREEN}  ✓ Docker CE installed.${NC}"
+                    echo -e "${YELLOW}  Note: You may need to log out and back in for group permissions.${NC}"
+                    echo -e "${YELLOW}  Alternatively, run: sg docker -c './run_benchmarks.sh ...'${NC}"
+                else
+                    echo ""
+                    echo "  To install manually:"
+                    echo "    https://docs.docker.com/engine/install/ubuntu/"
+                fi
+            fi
+            ;;
+        *)
+            echo "  Install Docker for your platform:"
+            echo "    https://docs.docker.com/get-docker/"
+            ;;
+    esac
+
+    # Re-check after potential install
+    if ! command -v docker &>/dev/null; then
+        echo ""
+        echo -e "${RED}  Docker is still not available. LLM benchmarks will fail.${NC}"
+        echo -e "${YELLOW}  You can still run ComfyUI-only benchmarks without Docker.${NC}"
+        echo ""
+        read -p "  Continue anyway? (ComfyUI benchmarks will still work) [y/N] " CONTINUE_NO_DOCKER
+        if [[ ! "$CONTINUE_NO_DOCKER" =~ ^[Yy] ]]; then
+            exit 1
+        fi
+        echo ""
+        echo -e "${YELLOW}⚠  Continuing without local Docker — LLM benchmarks will be skipped.${NC}"
+        NO_LOCAL_DOCKER=true
+    else
+        echo ""
+        echo -e "${GREEN}✓ Docker is now available locally.${NC}"
+        NO_LOCAL_DOCKER=false
+    fi
+else
+    echo -e "${GREEN}✓ Docker detected locally ($(docker --version 2>/dev/null | head -1)).${NC}"
+    NO_LOCAL_DOCKER=false
 fi
 
 # ============================================
@@ -854,6 +949,15 @@ for entry in "${TEST_MATRIX[@]}"; do
     echo -e "${BLUE}  Benchmark ${BENCH_COUNT}/${BENCH_TOTAL}: ${BENCH_PACK} → ${BENCH_MODEL}${NC}"
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
+
+    # Skip LLM benchmarks if local Docker is unavailable (genai-perf needs it)
+    if [ "${NO_LOCAL_DOCKER:-false}" = true ] && [ "$BENCH_PACK" != "comfy_ui" ]; then
+        echo -e "  ${YELLOW}⚠ Skipping ${BENCH_MODEL} — local Docker required for genai-perf client.${NC}"
+        FAILED_BENCHMARKS+=("${BENCH_MODEL} (skipped — no local Docker)")
+        _BENCH_ELAPSED=$(( $(date +%s) - _BENCH_START ))
+        BENCH_TIMINGS+=("${BENCH_PACK}|${BENCH_MODEL}|${_BENCH_ELAPSED}")
+        continue
+    fi
 
     # Pre-flight: forcibly remove any stale bench containers left by aborted prior runs
     target_cmd "docker rm -f puget_vllm puget_team_brain puget_team_webui puget_ollama 2>/dev/null; docker network prune -f 2>/dev/null" || true
