@@ -197,26 +197,28 @@ When `--run-all` is specified, the following models are tested (filtered by avai
 
 | # | Model | HF ID | Min VRAM | Notes |
 |---|---|---|---|---|
-| 1 | Qwen 3.6 35B MoE AWQ | `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit` | 22 GB | 128K ctx, always runs |
-| 2 | Qwen 3.5 35B MoE AWQ | `cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit` | 22 GB | 256K ctx |
-| 3 | Qwen 3.5 122B MoE AWQ | `cyankiwi/Qwen3.5-122B-A10B-AWQ-4bit` | 80 GB | 128K ctx |
-| 4 | DeepSeek R1 70B AWQ | `Valdemardi/DeepSeek-R1-Distill-Llama-70B-AWQ` | 40 GB | Reasoning specialist |
-| 5 | Nemotron 3 Nano 30B | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` | 20 GB | NVFP4, always runs |
-| 6 | Nemotron 3 Super 120B | `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` | 80 GB | NVFP4 flagship |
-| 7 | Gemma 4 26B MoE AWQ | `cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit` | 20 GB | Google MoE |
-| 8 | GPT-OSS 20B MXFP4 | `openai/gpt-oss-20b` | 16 GB | OpenAI open-weight, always runs |
-| 9 | GPT-OSS 120B MXFP4 | `openai/gpt-oss-120b` | 80 GB | OpenAI flagship open-weight |
+| 1 | Qwen 3 (8B) | `Qwen/Qwen3-8B` | 16 GB | Fast, single GPU, always runs |
+| 2 | Qwen 3 (32B FP8) | `Qwen/Qwen3-32B-FP8` | 40 GB | Near-lossless quality |
+| 3 | Qwen 3.5 35B MoE AWQ | `cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit` | 22 GB | 256K ctx |
+| 4 | Qwen 3.5 122B MoE AWQ | `cyankiwi/Qwen3.5-122B-A10B-AWQ-4bit` | 80 GB | Flagship, 128K ctx |
+| 5 | DeepSeek R1 70B AWQ | `Valdemardi/DeepSeek-R1-Distill-Llama-70B-AWQ` | 40 GB | Reasoning specialist |
+| 6 | Nemotron 3 Nano 30B | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` | 20 GB | NVFP4, always runs |
+| 7 | Nemotron 3 Super 120B | `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` | 80 GB | NVFP4 flagship |
+| 8 | Gemma 4 26B MoE AWQ | `cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit` | 20 GB | Google MoE, auto-skipped |
+
 
 ### Personal LLM (Ollama)
 
 | # | Model | Tag | Min VRAM | Notes |
 |---|---|---|---|---|
-| 1 | Qwen 3.6 35B MoE | `qwen3.6:35b` | 24 GB | Agentic coding, 256K ctx |
-| 2 | DeepSeek R1 70B | `deepseek-r1:70b` | 42 GB | Flagship reasoning |
-| 3 | Llama 4 Scout | `llama4:scout` | 63 GB | Multimodal (text+image) |
-| 4 | Nemotron 3 Nano 30B | `nemotron-3-nano:30b` | 24 GB | NVIDIA MoE reasoning |
-| 5 | Nemotron 3 Super | `nemotron-3-super` | 96 GB | NVIDIA flagship MoE |
-| 6 | Gemma 4 31B | `gemma4:31b` | 20 GB | Google dense instruct |
+| 1 | Qwen 3 (8B) | `qwen3:8b` | 5 GB | Fast, Low VRAM, always runs |
+| 2 | Qwen 3 (32B) | `qwen3:32b` | 20 GB | Best Quality, Single GPU |
+| 3 | DeepSeek R1 (70B) | `deepseek-r1:70b` | 42 GB | Flagship Reasoning, Dual GPU |
+| 4 | Llama 4 Scout | `llama4:scout` | 63 GB | Multimodal (text+image), Dual GPU |
+| 5 | Nemotron 3 Nano (30B) | `nemotron-3-nano:30b` | 24 GB | NVIDIA MoE Reasoning, Single GPU |
+| 6 | Nemotron 3 Super | `nemotron-3-super` | 96 GB | NVIDIA Flagship MoE, Multi-GPU |
+| 7 | Gemma 4 (31B) | `gemma4:31b` | 20 GB | Google, Dense Instruct, Single GPU |
+
 
 ### ComfyUI (Image Gen)
 

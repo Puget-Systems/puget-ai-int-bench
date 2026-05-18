@@ -576,65 +576,65 @@ get_vllm_model_info() {
 }
 
 define_run_all_matrix() {
-    # ── Team LLM (vLLM) — mirrors app-pack vllm_model_select.sh choices 1-9 ───
-    # Choice 1: Qwen 3.6 35B MoE AWQ — always available (22 GB)
-    TEST_MATRIX+=("team_llm|1|Qwen3.6-35B-A3B-AWQ|22||$CONCURRENCY")
+    # ── Team LLM (vLLM) — mirrors app-pack vllm_model_select.sh choices 1-8 ───
+    # Choice 1: Qwen 3 8B — always available (16 GB)
+    TEST_MATRIX+=("team_llm|1|Qwen3-8B|16||$CONCURRENCY")
 
-    # Choice 2: Qwen 3.5 35B MoE AWQ (22 GB)
-    if [ "$TOTAL_VRAM" -ge 22 ]; then
-        TEST_MATRIX+=("team_llm|2|Qwen3.5-35B-A3B-AWQ|22||$CONCURRENCY")
-    fi
-
-    # Choice 3: Qwen 3.5 122B MoE AWQ (80 GB)
-    if [ "$TOTAL_VRAM" -ge 80 ]; then
-        TEST_MATRIX+=("team_llm|3|Qwen3.5-122B-A10B-AWQ|80||$CONCURRENCY")
-    fi
-
-    # Choice 4: DeepSeek R1 70B AWQ (40 GB)
+    # Choice 2: Qwen 3 32B FP8 (40 GB)
     if [ "$TOTAL_VRAM" -ge 40 ]; then
-        TEST_MATRIX+=("team_llm|4|DeepSeek-R1-70B-AWQ|40||$CONCURRENCY")
+        TEST_MATRIX+=("team_llm|2|Qwen3-32B-FP8|40||$CONCURRENCY")
     fi
 
-    # Choice 5: Nemotron 3 Nano 30B NVFP4 (20 GB)
-    TEST_MATRIX+=("team_llm|5|Nemotron3-Nano-30B-NVFP4|20||$CONCURRENCY")
+    # Choice 3: Qwen 3.5 35B MoE AWQ (22 GB)
+    if [ "$TOTAL_VRAM" -ge 22 ]; then
+        TEST_MATRIX+=("team_llm|3|Qwen3.5-35B-A3B-AWQ|22||$CONCURRENCY")
+    fi
 
-    # Choice 6: Nemotron 3 Super 120B NVFP4 (80 GB)
+    # Choice 4: Qwen 3.5 122B MoE AWQ (80 GB)
     if [ "$TOTAL_VRAM" -ge 80 ]; then
-        TEST_MATRIX+=("team_llm|6|Nemotron3-Super-120B-NVFP4|80||$CONCURRENCY")
+        TEST_MATRIX+=("team_llm|4|Qwen3.5-122B-A10B-AWQ|80||$CONCURRENCY")
     fi
 
-    # Choice 7: Gemma 4 26B MoE AWQ (20 GB)
+    # Choice 5: DeepSeek R1 70B AWQ (40 GB)
+    if [ "$TOTAL_VRAM" -ge 40 ]; then
+        TEST_MATRIX+=("team_llm|5|DeepSeek-R1-70B-AWQ|40||$CONCURRENCY")
+    fi
+
+    # Choice 6: Nemotron 3 Nano 30B NVFP4 (20 GB)
+    TEST_MATRIX+=("team_llm|6|Nemotron3-Nano-30B-NVFP4|20||$CONCURRENCY")
+
+    # Choice 7: Nemotron 3 Super 120B NVFP4 (80 GB)
+    if [ "$TOTAL_VRAM" -ge 80 ]; then
+        TEST_MATRIX+=("team_llm|7|Nemotron3-Super-120B-NVFP4|80||$CONCURRENCY")
+    fi
+
+    # Choice 8: Gemma 4 26B MoE AWQ (20 GB)
     if [ "$TOTAL_VRAM" -ge 20 ]; then
-        TEST_MATRIX+=("team_llm|7|Gemma4-26B-A4B-AWQ|20||$CONCURRENCY")
-    fi
-
-    # Choice 8: GPT-OSS 20B MXFP4 (16 GB)
-    TEST_MATRIX+=("team_llm|8|GPT-OSS-20B-MXFP4|16||$CONCURRENCY")
-
-    # Choice 9: GPT-OSS 120B MXFP4 (80 GB)
-    if [ "$TOTAL_VRAM" -ge 80 ]; then
-        TEST_MATRIX+=("team_llm|9|GPT-OSS-120B-MXFP4|80||$CONCURRENCY")
+        TEST_MATRIX+=("team_llm|8|Gemma4-26B-A4B-AWQ|20||$CONCURRENCY")
     fi
 
     # ── Personal LLM (Ollama) — mirrors app-pack ollama_model_select.sh ─────
-    if [ "$TOTAL_VRAM" -ge 24 ]; then
-        TEST_MATRIX+=("personal_llm|1|qwen3.6:35b|24|qwen3.6:35b|1")
+    TEST_MATRIX+=("personal_llm|1|qwen3:8b|5|qwen3:8b|1")
+
+    if [ "$TOTAL_VRAM" -ge 20 ]; then
+        TEST_MATRIX+=("personal_llm|2|qwen3:32b|20|qwen3:32b|1")
     fi
     if [ "$TOTAL_VRAM" -ge 42 ]; then
-        TEST_MATRIX+=("personal_llm|2|deepseek-r1:70b|42|deepseek-r1:70b|1")
+        TEST_MATRIX+=("personal_llm|3|deepseek-r1:70b|42|deepseek-r1:70b|1")
     fi
     if [ "$TOTAL_VRAM" -ge 63 ]; then
-        TEST_MATRIX+=("personal_llm|3|llama4:scout|63|llama4:scout|1")
+        TEST_MATRIX+=("personal_llm|4|llama4:scout|63|llama4:scout|1")
     fi
     if [ "$TOTAL_VRAM" -ge 24 ]; then
-        TEST_MATRIX+=("personal_llm|4|nemotron-3-nano:30b|24|nemotron-3-nano:30b|1")
+        TEST_MATRIX+=("personal_llm|5|nemotron-3-nano:30b|24|nemotron-3-nano:30b|1")
     fi
     if [ "$TOTAL_VRAM" -ge 96 ]; then
-        TEST_MATRIX+=("personal_llm|5|nemotron-3-super|96|nemotron-3-super|1")
+        TEST_MATRIX+=("personal_llm|6|nemotron-3-super|96|nemotron-3-super|1")
     fi
     if [ "$TOTAL_VRAM" -ge 20 ]; then
-        TEST_MATRIX+=("personal_llm|6|gemma4:31b|20|gemma4:31b|1")
+        TEST_MATRIX+=("personal_llm|7|gemma4:31b|20|gemma4:31b|1")
     fi
+
 
     # ── ComfyUI image generation ──────────────────────────────────────
     if [ "$TOTAL_VRAM" -ge 16 ]; then
