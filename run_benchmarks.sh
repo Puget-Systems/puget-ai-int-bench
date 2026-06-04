@@ -991,8 +991,14 @@ for entry in "${TEST_MATRIX[@]}"; do
         if [[ "$BENCH_CHOICE" == "custom" || ! "$BENCH_CHOICE" =~ ^[0-9]+$ ]]; then
             # Custom model
             custom_image="latest"
+            local custom_mem_util="0.90"
             if [ "$GPU_VENDOR" = "amd" ]; then
                 custom_image="vllm/vllm-openai-rocm:latest"
+                if [ "$GPU_COUNT" -gt 1 ]; then
+                    custom_mem_util="0.82"
+                else
+                    custom_mem_util="0.85"
+                fi
             elif [ "$GPU_VENDOR" = "intel" ]; then
                 custom_image="intel/llm-scaler-vllm:0.14.0-b8.2.1"
             else
@@ -1002,7 +1008,7 @@ for entry in "${TEST_MATRIX[@]}"; do
 MODEL_ID=${BENCH_MODEL}
 VLLM_IMAGE=${custom_image}
 GPU_COUNT=${GPU_COUNT}
-GPU_MEMORY_UTILIZATION=0.90
+GPU_MEMORY_UTILIZATION=${custom_mem_util}
 DTYPE=auto
 REASONING_ARGS=
 TOOL_CALL_ARGS=
