@@ -1045,20 +1045,23 @@ ENVEOF
         # The app-pack compose creates a per-project vllm_cache volume; we override
         # it to use a single shared external volume so models download once.
         target_cmd "docker volume create shared_vllm_cache 2>/dev/null || true"
-        _OVERRIDE="services:\n  inference:\n"
+        _ENV=""
         if [ -n "$HF_TOKEN" ]; then
-            _OVERRIDE+="    environment:\n      - HF_TOKEN=${HF_TOKEN}\n      - HUGGINGFACE_TOKEN=${HF_TOKEN}\n      - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN}\n"
+            _ENV+="      - HF_TOKEN=${HF_TOKEN}\n      - HUGGINGFACE_TOKEN=${HF_TOKEN}\n      - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN}\n"
         fi
         # AMD ROCm: override NVIDIA deploy block, add device mappings
         if [ "$GPU_VENDOR" = "amd" ]; then
+            _OVERRIDE="services:\n  inference:\n"
             _OVERRIDE+="    deploy: {}\n"
             _OVERRIDE+="    privileged: true\n"
             _OVERRIDE+="    devices:\n      - /dev/dri:/dev/dri\n      - /dev/kfd:/dev/kfd\n"
-            if echo "$_OVERRIDE" | grep -q 'environment:'; then
-                _OVERRIDE+="      - HSA_OVERRIDE_GFX_VERSION=12.0.1\n      - VLLM_TARGET_DEVICE=rocm\n"
-            else
-                _OVERRIDE+="    environment:\n      - HSA_OVERRIDE_GFX_VERSION=12.0.1\n      - VLLM_TARGET_DEVICE=rocm\n"
-            fi
+            _ENV+="      - HSA_OVERRIDE_GFX_VERSION=12.0.1\n      - VLLM_TARGET_DEVICE=rocm\n"
+        else
+            _OVERRIDE="services:\n  inference:\n"
+        fi
+
+        if [ -n "$_ENV" ]; then
+            _OVERRIDE+="    environment:\n${_ENV}"
         fi
         _OVERRIDE+="volumes:\n  vllm_cache:\n    external: true\n    name: shared_vllm_cache\n"
         target_cmd "printf '${_OVERRIDE}' > \"${WORK_DIR}/docker-compose.override.yml\""
