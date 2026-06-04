@@ -123,9 +123,40 @@ else
 fi
 
 # ============================================
-# 3. NVIDIA Drivers
+# 3. GPU Detection & Driver Management
 # ============================================
-if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+
+# --- AMD GPU Detection ---
+# Check for AMD GPUs via /dev/kfd and PCI vendor 0x1002
+AMD_GPU_FOUND=false
+if [ -e /dev/kfd ]; then
+    for card_dir in /sys/class/drm/card[0-9]*/; do
+        vendor_file="$card_dir/device/vendor"
+        if [ -f "$vendor_file" ] && [ "$(cat "$vendor_file")" = "0x1002" ]; then
+            AMD_GPU_FOUND=true
+            break
+        fi
+    done
+fi
+
+if $AMD_GPU_FOUND; then
+    echo -e "${GREEN}✓ AMD GPU detected via /dev/kfd${NC}"
+    # Show AMD GPU info
+    if command -v lspci &>/dev/null; then
+        AMD_GPU_NAME=$(lspci 2>/dev/null | grep -iE 'vga|display|3d' | grep -i 'amd\|radeon\|navi' | head -1)
+        echo -e "${GREEN}  $AMD_GPU_NAME${NC}"
+    fi
+    # VRAM from sysfs
+    for f in /sys/class/drm/card[0-9]*/device/mem_info_vram_total; do
+        if [ -f "$f" ]; then
+            VRAM_BYTES=$(cat "$f")
+            VRAM_GB=$((VRAM_BYTES / 1024 / 1024 / 1024))
+            echo -e "${GREEN}  VRAM: ${VRAM_GB} GB${NC}"
+            break
+        fi
+    done
+    echo -e "${GREEN}  AMD GPUs use containerized ROCm — no host driver installation needed.${NC}"
+elif command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
     DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
     GPU_NAME=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader | head -1)
     echo -e "${GREEN}✓ NVIDIA Driver found: $DRIVER_VERSION ($GPU_NAME)${NC}"
@@ -183,9 +214,12 @@ else
 fi
 
 # ============================================
-# 4. NVIDIA Container Toolkit
+# 4. Container Toolkit & GPU Runtime
 # ============================================
-if dpkg -l nvidia-container-toolkit &>/dev/null 2>&1; then
+if $AMD_GPU_FOUND; then
+    # AMD GPUs use device mappings (--device /dev/kfd /dev/dri), no special toolkit needed
+    echo -e "${GREEN}✓ AMD GPUs use device mappings — no container toolkit required.${NC}"
+elif dpkg -l nvidia-container-toolkit &>/dev/null 2>&1; then
     echo -e "${GREEN}✓ NVIDIA Container Toolkit found.${NC}"
 else
     echo -e "${YELLOW}Installing NVIDIA Container Toolkit...${NC}"
@@ -202,9 +236,18 @@ else
 fi
 
 # ============================================
-# 5. Configure Docker for NVIDIA GPU access
+# 5. Verify GPU access from Docker containers
 # ============================================
-if command -v nvidia-ctk &>/dev/null && command -v docker &>/dev/null && ! $NEEDS_REBOOT; then
+if $AMD_GPU_FOUND && command -v docker &>/dev/null && ! $NEEDS_REBOOT; then
+    echo -e "${BLUE}Verifying AMD GPU access in Docker...${NC}"
+    if sudo docker run --rm --device /dev/kfd --device /dev/dri \
+        -e HSA_OVERRIDE_GFX_VERSION=12.0.1 \
+        rocm/pytorch:rocm6.2.4-py3.11-ubuntu22.04 rocm-smi --showid &>/dev/null; then
+        echo -e "${GREEN}✓ AMD GPU accessible from Docker containers.${NC}"
+    else
+        echo -e "${YELLOW}⚠ AMD GPU verification did not pass. Container access may need configuration.${NC}"
+    fi
+elif command -v nvidia-ctk &>/dev/null && command -v docker &>/dev/null && ! $NEEDS_REBOOT; then
     # Use sudo for docker commands since user may not have docker group active in this session
     if ! sudo docker info 2>/dev/null | grep -q "nvidia"; then
         echo -e "${BLUE}Configuring Docker NVIDIA runtime...${NC}"
