@@ -995,9 +995,9 @@ for entry in "${TEST_MATRIX[@]}"; do
             if [ "$GPU_VENDOR" = "amd" ]; then
                 custom_image="vllm/vllm-openai-rocm:latest"
                 if [ "$GPU_COUNT" -gt 1 ]; then
-                    custom_mem_util="0.82"
+                    custom_mem_util="0.75"
                 else
-                    custom_mem_util="0.85"
+                    custom_mem_util="0.80"
                 fi
             elif [ "$GPU_VENDOR" = "intel" ]; then
                 custom_image="intel/llm-scaler-vllm:0.14.0-b8.2.1"
