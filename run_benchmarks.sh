@@ -991,7 +991,7 @@ for entry in "${TEST_MATRIX[@]}"; do
         if [[ "$BENCH_CHOICE" == "custom" || ! "$BENCH_CHOICE" =~ ^[0-9]+$ ]]; then
             # Custom model
             custom_image="latest"
-            local custom_mem_util="0.90"
+            custom_mem_util="0.90"
             if [ "$GPU_VENDOR" = "amd" ]; then
                 custom_image="vllm/vllm-openai-rocm:latest"
                 if [ "$GPU_COUNT" -gt 1 ]; then
