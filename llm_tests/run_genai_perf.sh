@@ -146,7 +146,8 @@ for CTX in "${CTX_LIST[@]}"; do
             --artifact-dir "results/${ARTIFACT_SUBDIR}" \
             --measurement-interval 30000 \
             --stability-percentage 999 \
-            $TOKENIZER_ARG
+            $TOKENIZER_ARG \
+            -- --max-trials 3
 
         echo "  Done: concurrency=${CONC}, input_tokens=${CTX}"
     done

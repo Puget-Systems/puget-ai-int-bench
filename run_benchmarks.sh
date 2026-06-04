@@ -1140,6 +1140,9 @@ ENVEOF
 
         API_MODEL=$(target_cmd "curl -s http://localhost:8000/v1/models 2>/dev/null | grep -o '\"id\":\"[^\"]*' | head -n 1 | cut -d'\"' -f4" || echo "$BENCH_MODEL")
 
+        echo -e "  ${YELLOW}Pre-warming model to trigger Triton JIT compile...${NC}"
+        target_cmd "curl -s -X POST http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\": \"$API_MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"Pre-warmup: Puget Systems.\"}], \"max_tokens\": 50}' >/dev/null" || true
+
         echo ""
         if ! run_genai_perf_client "vllm" "${BENCH_URL_BASE}:8000" "$API_MODEL" "$BENCH_CONCURRENCY" "$BENCH_RESULTS_DIR"; then
             echo -e "  ${RED}✗ genai-perf failed for ${BENCH_MODEL}${NC}"
