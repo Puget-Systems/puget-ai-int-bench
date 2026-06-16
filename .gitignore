@@ -6,3 +6,5 @@ bench.conf
 .venv/
 nohup.out
 *.log
+images/
+puget-docker-app-packs-check/

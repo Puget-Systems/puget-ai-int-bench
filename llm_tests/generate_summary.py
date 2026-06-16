@@ -28,41 +28,55 @@ def find_result_files(results_dir):
     results = {}
     results_path = Path(results_dir)
 
-    # Strategy 1: Look in per-benchmark subdirectories (new automated mode)
-    # e.g., results/host_timestamp/team_llm_Qwen_Qwen3-8B/concurrency_1/
-    for subdir in sorted(results_path.iterdir()):
-        if subdir.is_dir() and subdir.name != "." and not subdir.name.startswith("."):
-            bench_label = subdir.name
-            for json_file in sorted(subdir.glob("**/profile_export_genai_perf.json")):
-                parent = json_file.parent.name
-                if parent.startswith("concurrency_"):
-                    try:
-                        conc = int(parent.split("_")[1])
-                        results[(bench_label, conc)] = json_file
-                    except (ValueError, IndexError):
-                        continue
-
-    # Strategy 2: Look in top-level concurrency_* dirs (legacy single-model mode)
-    for json_file in sorted(results_path.glob("concurrency_*/profile_export_genai_perf.json")):
-        parent = json_file.parent.name
-        if parent.startswith("concurrency_"):
-            try:
-                conc = int(parent.split("_")[1])
-                results[("default", conc)] = json_file
-            except (ValueError, IndexError):
-                continue
-
-    # Strategy 3: Inside genai_perf_* subdirectories (remote mode)
-    for subdir in sorted(results_path.glob("genai_perf_*")):
-        if subdir.is_dir():
-            for json_file in sorted(subdir.glob("**/profile_export_genai_perf.json")):
-                parent = json_file.parent.name
-                if parent.startswith("concurrency_"):
-                    try:
-                        conc = int(parent.split("_")[1])
-                        results[(subdir.name, conc)] = json_file
-                    except (ValueError, IndexError):
-                        continue
+    # Walk all files recursively and search for profile_export_genai_perf.json
+    for json_file in sorted(results_path.glob("**/profile_export_genai_perf.json")):
+        # Skip if it is not a file
+        if not json_file.is_file():
+            continue
+            
+        rel_parts = json_file.relative_to(results_path).parts
+        if not rel_parts:
+            continue
+            
+        # Determine the bench label (first subdir in results_dir, or 'default' if top level)
+        bench_label = rel_parts[0] if len(rel_parts) > 1 else "default"
+        
+        # Try to find concurrency in the path parts
+        conc = None
+        for part in rel_parts:
+            # check for "concurrency_<N>" (e.g., concurrency_1, ctx500_concurrency_1)
+            if "concurrency_" in part:
+                try:
+                    sub = part.split("concurrency_")[1]
+                    digits = ""
+                    for char in sub:
+                        if char.isdigit():
+                            digits += char
+                        else:
+                            break
+                    if digits:
+                        conc = int(digits)
+                        break
+                except (ValueError, IndexError):
+                    pass
+            # check for "concurrency<N>" (e.g. Qwen_...-concurrency1)
+            elif "concurrency" in part:
+                try:
+                    sub = part.split("concurrency")[1]
+                    digits = ""
+                    for char in sub:
+                        if char.isdigit():
+                            digits += char
+                        else:
+                            break
+                    if digits:
+                        conc = int(digits)
+                        break
+                except (ValueError, IndexError):
+                    pass
+                    
+        if conc is not None:
+            results[(bench_label, conc)] = json_file
 
     return results
 

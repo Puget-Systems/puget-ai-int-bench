@@ -53,7 +53,46 @@ collect_system_specs() {
     if [ -n "$gpu_info" ]; then
         echo "$gpu_info" >> "$spec_file"
     else
-        echo "  nvidia-smi not found. No NVIDIA GPUs detected." >> "$spec_file"
+        # Try AMD GPU detection
+        local amd_info
+        amd_info=$($run_cmd "lspci 2>/dev/null | grep -iE 'vga|display|3d' | grep -iE 'amd|radeon|navi'" || echo "")
+        if [ -n "$amd_info" ]; then
+            echo "  AMD GPUs detected:" >> "$spec_file"
+            echo "$amd_info" >> "$spec_file"
+            # VRAM from sysfs
+            local vram_info
+            vram_info=$($run_cmd "for f in /sys/class/drm/card[0-9]*/device/mem_info_vram_total; do [ -f \"\\\$f\" ] && echo \"\\\$f: \$(cat \"\\\$f\")\"; done 2>/dev/null" || echo "")
+            if [ -n "$vram_info" ]; then
+                echo "" >> "$spec_file"
+                echo "  VRAM:" >> "$spec_file"
+                echo "$vram_info" >> "$spec_file"
+            fi
+            # ROCm info (if available)
+            local rocm_info
+            rocm_info=$($run_cmd "rocm-smi --showhw 2>/dev/null" || echo "")
+            if [ -n "$rocm_info" ]; then
+                echo "" >> "$spec_file"
+                echo "  ROCm SMI:" >> "$spec_file"
+                echo "$rocm_info" >> "$spec_file"
+            fi
+        else
+            # Try Intel GPU detection
+            local intel_info
+            intel_info=$($run_cmd "lspci 2>/dev/null | grep -iE 'vga|display|3d' | grep -i 'intel'" || echo "")
+            if [ -n "$intel_info" ]; then
+                echo "  Intel GPUs detected:" >> "$spec_file"
+                echo "$intel_info" >> "$spec_file"
+                local dri_info
+                dri_info=$($run_cmd "ls -la /dev/dri/ 2>/dev/null" || echo "")
+                if [ -n "$dri_info" ]; then
+                    echo "" >> "$spec_file"
+                    echo "  DRI Render Nodes:" >> "$spec_file"
+                    echo "$dri_info" >> "$spec_file"
+                fi
+            else
+                echo "  No NVIDIA, AMD, or Intel GPUs detected." >> "$spec_file"
+            fi
+        fi
     fi
     echo "" >> "$spec_file"
 

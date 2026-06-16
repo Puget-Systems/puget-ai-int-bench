@@ -29,7 +29,7 @@ NC='\033[0m'
 # ============================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_PACK_REPO="https://github.com/Puget-Systems/puget-docker-app-packs.git"
-APP_PACK_BRANCH="main"
+APP_PACK_BRANCH="amd-rocm"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/puget-bench"
 CONFIG_FILE="$CONFIG_DIR/bench.conf"
 
@@ -47,12 +47,16 @@ SSH_KEY=""
 INPUT_TOKENS=500
 OUTPUT_TOKENS=500
 NUM_PROMPTS=50
+MEASUREMENT_INTERVAL=30000
 COMFY_ITERATIONS=10
 CONTEXT_LENGTHS=""  # e.g. "4096,32768,131072" — empty = use INPUT_TOKENS only
 SKIP_CHECKSUM=false
 HF_TOKEN=""         # HuggingFace token — load from bench.conf or --hf-token flag
 SUDO_PASS=""        # Remote sudo password — load from bench.conf or --sudo-pass flag
 NO_LOCAL_DOCKER=false  # Set by local preflight if Docker is unavailable
+FRESH_CACHE=false      # If true, clear model caches before running (default: keep cache)
+REQUEST_TIMEOUT=""     # Per-request timeout (seconds) for genai-perf — extend for thinking models
+GPU_COUNT_OVERRIDE=""  # Force a specific GPU count for custom models (e.g. 1 = single-GPU TP=1)
 
 # ============================================
 # Load Config File (if exists)
@@ -85,12 +89,16 @@ while [[ "$#" -gt 0 ]]; do
         --input-tokens) INPUT_TOKENS="$2"; shift ;;
         --output-tokens) OUTPUT_TOKENS="$2"; shift ;;
         --num-prompts) NUM_PROMPTS="$2"; shift ;;
+        --measurement-interval) MEASUREMENT_INTERVAL="$2"; shift ;;
         --ssh-key) SSH_KEY="$2"; shift ;;
         --comfy-iterations) COMFY_ITERATIONS="$2"; shift ;;
         --context-lengths) CONTEXT_LENGTHS="$2"; shift ;;
         --skip-checksum) SKIP_CHECKSUM=true ;;
+        --fresh-cache) FRESH_CACHE=true ;;
         --hf-token) HF_TOKEN="$2"; shift ;;
         --sudo-pass) SUDO_PASS="$2"; shift ;;
+        --request-timeout) REQUEST_TIMEOUT="$2"; shift ;;
+        --gpu-count) GPU_COUNT_OVERRIDE="$2"; shift ;;
         -h|--help)
             echo -e "${BLUE}Puget Systems AI App Pack — Automated Benchmark Suite${NC}"
             echo ""
@@ -111,6 +119,7 @@ while [[ "$#" -gt 0 ]]; do
             echo "  --ssh-key PATH       Path to SSH private key"
             echo "  --comfy-iterations N Number of images per ComfyUI benchmark run (default: 10)"
             echo "  --context-lengths L  Comma-separated input token sizes to benchmark (e.g. 4096,32768,131072)"
+            echo "  --fresh-cache        Clear model caches before running (default: keep cached models)"
             exit 0
             ;;
         *) echo -e "${RED}Unknown parameter: $1. Use --help for usage.${NC}"; exit 1 ;;
@@ -140,6 +149,136 @@ target_cmd() {
     ssh "${SSH_OPTS[@]}" "$HOST" "$@"
 }
 
+# ============================================
+# GPU Power Monitoring
+# ============================================
+# Uses sysfs hwmon (amdgpu / Intel xe|i915) or nvidia-smi to poll GPU power
+# draw during benchmarks. Writes timestamped readings to a temp file on the
+# remote host.
+
+POWER_MONITOR_LOG="/tmp/puget_bench_power.csv"
+
+start_power_monitor() {
+    local interval="${1:-2}"  # polling interval in seconds
+
+    # Kill any stale monitor from a previous run
+    target_cmd "kill \$(cat /tmp/puget_bench_power.pid 2>/dev/null) 2>/dev/null; rm -f $POWER_MONITOR_LOG /tmp/puget_bench_power.pid" 2>/dev/null || true
+
+    if [ "$GPU_VENDOR" = "amd" ]; then
+        # AMD: read power from sysfs hwmon (power1_average is in microwatts)
+        target_cmd "nohup bash -c '
+            echo \"timestamp_s,total_gpu_watts\" > $POWER_MONITOR_LOG
+            while true; do
+                total_uw=0
+                for f in /sys/class/hwmon/hwmon*/power1_average; do
+                    name=\$(cat \$(dirname \$f)/name 2>/dev/null)
+                    if [ \"\$name\" = \"amdgpu\" ]; then
+                        uw=\$(cat \$f 2>/dev/null || echo 0)
+                        total_uw=\$((total_uw + uw))
+                    fi
+                done
+                watts=\$(echo \"scale=1; \$total_uw / 1000000\" | bc)
+                echo \"\$(date +%s),\$watts\" >> $POWER_MONITOR_LOG
+                sleep $interval
+            done
+        ' > /dev/null 2>&1 & echo \$! > /tmp/puget_bench_power.pid" 2>/dev/null
+    elif [ "$GPU_VENDOR" = "intel" ]; then
+        # Intel XPU (Arc / Battlemage): read power from sysfs hwmon exposed by the
+        # xe (or legacy i915) driver. power1_average is in microwatts. Falls back to
+        # an energy1_input delta when an average reading is unavailable.
+        target_cmd "nohup bash -c '
+            echo \"timestamp_s,total_gpu_watts\" > $POWER_MONITOR_LOG
+            declare -A prev_uj
+            prev_t=\$(date +%s%N)
+            while true; do
+                total_uw=0
+                now_t=\$(date +%s%N)
+                for d in /sys/class/hwmon/hwmon*; do
+                    name=\$(cat \$d/name 2>/dev/null)
+                    if [ \"\$name\" = \"xe\" ] || [ \"\$name\" = \"i915\" ]; then
+                        if [ -r \"\$d/power1_average\" ]; then
+                            uw=\$(cat \$d/power1_average 2>/dev/null || echo 0)
+                            total_uw=\$((total_uw + uw))
+                        elif [ -r \"\$d/energy1_input\" ]; then
+                            uj=\$(cat \$d/energy1_input 2>/dev/null || echo 0)
+                            if [ -n \"\${prev_uj[\$d]:-}\" ]; then
+                                d_uj=\$((uj - prev_uj[\$d]))
+                                d_ns=\$((now_t - prev_t))
+                                [ \$d_ns -gt 0 ] && total_uw=\$((total_uw + d_uj * 1000000000 / d_ns))
+                            fi
+                            prev_uj[\$d]=\$uj
+                        fi
+                    fi
+                done
+                prev_t=\$now_t
+                watts=\$(echo \"scale=1; \$total_uw / 1000000\" | bc)
+                echo \"\$(date +%s),\$watts\" >> $POWER_MONITOR_LOG
+                sleep $interval
+            done
+        ' > /dev/null 2>&1 & echo \$! > /tmp/puget_bench_power.pid" 2>/dev/null
+    else
+        echo -e "  ${YELLOW}⚠ Power monitoring not supported for GPU vendor: $GPU_VENDOR${NC}"
+        return 1
+    fi
+
+    echo -e "  ${BLUE}⚡ GPU power monitor started (polling every ${interval}s)${NC}"
+}
+
+stop_power_monitor() {
+    local results_dir="${1:-.}"
+
+    # Kill the background monitor
+    target_cmd "kill \$(cat /tmp/puget_bench_power.pid 2>/dev/null) 2>/dev/null; rm -f /tmp/puget_bench_power.pid" 2>/dev/null || true
+
+    # Retrieve and process readings
+    local readings
+    readings=$(target_cmd "cat $POWER_MONITOR_LOG 2>/dev/null" 2>/dev/null) || true
+
+    if [ -z "$readings" ] || [ "$(echo "$readings" | wc -l)" -le 2 ]; then
+        echo -e "  ${YELLOW}⚠ No power data collected${NC}"
+        LAST_AVG_GPU_WATTS=""
+        LAST_PEAK_GPU_WATTS=""
+        return 1
+    fi
+
+    # Calculate average and peak from CSV (skip header)
+    local stats
+    stats=$(echo "$readings" | tail -n +2 | awk -F',' '
+        NR==1 { min=$2; max=$2 }
+        { sum+=$2; count++; if($2>max) max=$2; if($2<min) min=$2 }
+        END {
+            if(count>0) printf "%.1f,%.1f,%.1f,%d", sum/count, max, min, count
+            else print "0,0,0,0"
+        }
+    ')
+
+    IFS=',' read -r avg_w peak_w min_w sample_count <<< "$stats"
+    LAST_AVG_GPU_WATTS="$avg_w"
+    LAST_PEAK_GPU_WATTS="$peak_w"
+
+    echo -e "  ${GREEN}⚡ GPU Power: avg=${avg_w}W  peak=${peak_w}W  min=${min_w}W  (${sample_count} samples)${NC}"
+
+    # Save power report alongside benchmark results
+    if [ -d "$results_dir" ]; then
+        cat > "$results_dir/power_report.txt" <<EOF
+GPU Power Report
+================
+Average GPU Power: ${avg_w}W
+Peak GPU Power:    ${peak_w}W
+Min GPU Power:     ${min_w}W
+Samples:           ${sample_count}
+Interval:          2s
+
+Raw Data:
+$readings
+EOF
+        echo -e "  ${BLUE}  Power report saved to ${results_dir}/power_report.txt${NC}"
+    fi
+
+    # Clean up remote log
+    target_cmd "rm -f $POWER_MONITOR_LOG" 2>/dev/null || true
+}
+
 run_genai_perf_client() {
     local endpoint="$1"
     local url="$2"
@@ -149,53 +288,49 @@ run_genai_perf_client() {
 
     local port
     port=$(echo "$url" | grep -o ':[0-9]*$' | tr -d ':')
-    
-    # Find a random available local port for the tunnel
-    local local_port
-    while true; do
-        local_port=$((10000 + RANDOM % 10000))
-        if ! nc -z 127.0.0.1 $local_port 2>/dev/null; then
-            break
-        fi
-    done
 
-    echo -e "  ${BLUE}Starting SSH tunnel for genai-perf (local port $local_port -> remote $port)...${NC}"
-    # Start SSH tunnel in background
-    ssh -f -N -L "$local_port:127.0.0.1:$port" "${SSH_OPTS[@]}" "$HOST"
-    
-    # Give the tunnel a second to establish
-    sleep 1
-    
-    local tunnel_pid
-    tunnel_pid=$(lsof -t -i:$local_port | head -1)
+    # Run the genai-perf client ON THE REMOTE host (native Linux networking),
+    # not locally through an SSH tunnel. Docker Desktop's host.docker.internal
+    # gateway corrupts requests at high concurrency (HTTP 400s ≥ ~32 concurrent),
+    # while the remote container talking to localhost:$port is rock solid.
+    # Results are written to a remote dir and rsync'd back to $results_dir.
+    local safe_tag
+    safe_tag=$(echo "${model}_${concurrency}" | tr '/:, ' '____')
+    local remote_res="$REMOTE_TEMP_DIR/genai_${safe_tag}"
+    target_cmd "rm -rf '$remote_res'; mkdir -p '$remote_res'"
 
-    echo -e "  ${BLUE}Running genai-perf benchmark locally pointed at host.docker.internal:${local_port}...${NC}"
+    # Ship the genai-perf runner to the remote (single source of truth)
+    scp "${SSH_OPTS[@]}" "$SCRIPT_DIR/llm_tests/run_genai_perf.sh" "$HOST:$REMOTE_TEMP_DIR/run_genai_perf.sh" >/dev/null 2>&1
 
     local ctx_arg=""
     if [ -n "${CONTEXT_LENGTHS:-}" ]; then
         ctx_arg="--context-lengths ${CONTEXT_LENGTHS}"
     fi
 
-    local exit_code=0
-    (
-        cd "$SCRIPT_DIR/llm_tests"
-        # shellcheck disable=SC2086
-        ./run_genai_perf.sh \
-            --endpoint "$endpoint" \
-            --url "http://host.docker.internal:$local_port" \
-            --model "$model" \
-            --concurrency "$concurrency" \
-            --input-tokens "$INPUT_TOKENS" \
-            --output-tokens "$OUTPUT_TOKENS" \
-            --num-prompts "$NUM_PROMPTS" \
-            --results-dir "$results_dir" \
-            $ctx_arg
-    ) || exit_code=$?
+    echo -e "  ${BLUE}Running genai-perf on remote host (native net) → localhost:${port}...${NC}"
 
-    echo -e "  ${BLUE}Closing SSH tunnel...${NC}"
-    if [ -n "$tunnel_pid" ]; then
-        kill -9 "$tunnel_pid" 2>/dev/null || true
+    local rt_arg=""
+    if [ -n "${REQUEST_TIMEOUT:-}" ]; then
+        rt_arg="--request-timeout ${REQUEST_TIMEOUT}"
     fi
+
+    local exit_code=0
+    # HF_TOKEN/HF_ENDPOINT are exported into the remote shell so run_genai_perf.sh
+    # can forward them into the SDK container for tokenizer downloads (gated models).
+    target_cmd "export HF_TOKEN='${HF_TOKEN}' HUGGINGFACE_HUB_TOKEN='${HF_TOKEN}' HF_ENDPOINT='${HF_MIRROR:-}'; bash '$REMOTE_TEMP_DIR/run_genai_perf.sh' \
+        --endpoint '$endpoint' \
+        --url 'http://localhost:$port' \
+        --model '$model' \
+        --concurrency '$concurrency' \
+        --input-tokens '$INPUT_TOKENS' \
+        --output-tokens '$OUTPUT_TOKENS' \
+        --num-prompts '$NUM_PROMPTS' \
+        --results-dir '$remote_res' \
+        --measurement-interval '$MEASUREMENT_INTERVAL' \
+        $rt_arg $ctx_arg" || exit_code=$?
+
+    # Pull results back to the local master results dir
+    rsync -a -e "ssh ${SSH_OPTS[*]}" "$HOST:$remote_res/" "$results_dir/" 2>/dev/null || true
 
     return $exit_code
 }
@@ -315,21 +450,21 @@ else
 fi
 
 # ============================================
-# 0.5. Remote Preflight — Docker & NVIDIA Provisioning
+# 0.5. Remote Preflight — Docker & GPU Provisioning
 # ============================================
-# Check if Docker and nvidia-smi are both available remotely
+# Check if Docker and GPU drivers (NVIDIA or Intel) are available remotely
 NEED_PREFLIGHT=false
 if ! target_cmd "command -v docker > /dev/null 2>&1"; then
     echo ""
     echo -e "${YELLOW}[0.5/6] Docker not found on remote server — running preflight provisioning...${NC}"
-    echo -e "${YELLOW}  This will install Docker CE, NVIDIA drivers, and Container Toolkit.${NC}"
+    echo -e "${YELLOW}  This will install Docker CE and GPU drivers.${NC}"
     NEED_PREFLIGHT=true
-elif ! target_cmd "command -v nvidia-smi > /dev/null 2>&1"; then
+elif ! target_cmd "command -v nvidia-smi > /dev/null 2>&1" && ! target_cmd "ls /dev/dri/renderD* > /dev/null 2>&1"; then
     echo ""
-    echo -e "${YELLOW}[0.5/6] NVIDIA drivers not found on remote server — running preflight...${NC}"
+    echo -e "${YELLOW}[0.5/6] No GPU drivers found on remote server — running preflight...${NC}"
     NEED_PREFLIGHT=true
 else
-    echo -e "${GREEN}✓ Docker and NVIDIA drivers detected on remote server.${NC}"
+    echo -e "${GREEN}✓ Docker and GPU drivers detected on remote server.${NC}"
 fi
 
 if [ "$NEED_PREFLIGHT" = true ]; then
@@ -498,17 +633,21 @@ echo ""
 echo -e "${YELLOW}[3/6] Detecting hardware on remote server...${NC}"
 
 # We execute a small inline script remotely that sources gpu_detect.sh and prints key variables back to us
-GPU_INFO=$(target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\" && if detect_gpus; then echo \"OK|\$GPU_COUNT|\$TOTAL_VRAM|\$GPU_NAME|\$IS_BLACKWELL|\$COMPUTE_CAP\"; else echo \"FAIL\"; fi'")
+GPU_INFO=$(target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\" && if detect_gpus; then echo \"OK|\$GPU_VENDOR|\$GPU_COUNT|\$TOTAL_VRAM|\$GPU_NAME|\$IS_BLACKWELL|\$COMPUTE_CAP|\$VRAM_GB\"; else echo \"FAIL\"; fi'")
 
 if [[ "$GPU_INFO" == "FAIL" || -z "$GPU_INFO" ]]; then
-    echo -e "${RED}✗ nvidia-smi not found or failed on remote server. GPU benchmarks require NVIDIA drivers.${NC}"
+    echo -e "${RED}✗ No GPUs detected on remote server. GPU benchmarks require NVIDIA, Intel, or AMD GPU drivers.${NC}"
     exit 1
 fi
 
-IFS='|' read -r status GPU_COUNT TOTAL_VRAM GPU_NAME IS_BLACKWELL COMPUTE_CAP <<< "$GPU_INFO"
+IFS='|' read -r status GPU_VENDOR GPU_COUNT TOTAL_VRAM GPU_NAME IS_BLACKWELL COMPUTE_CAP VRAM_GB <<< "$GPU_INFO"
 
-echo -e "${GREEN}✓ Found ${GPU_COUNT}x ${GPU_NAME} (${TOTAL_VRAM} GB total)${NC}"
-if [ "$IS_BLACKWELL" = "true" ]; then
+echo -e "${GREEN}✓ Found ${GPU_COUNT}x ${GPU_NAME} (${TOTAL_VRAM} GB total) [vendor: ${GPU_VENDOR}]${NC}"
+if [ "$GPU_VENDOR" = "amd" ]; then
+    echo -e "${GREEN}  AMD GPU detected → using ROCm container paths${NC}"
+elif [ "$GPU_VENDOR" = "intel" ]; then
+    echo -e "${GREEN}  Intel XPU detected → using XPU container paths${NC}"
+elif [ "$IS_BLACKWELL" = "true" ]; then
     echo -e "${GREEN}  Blackwell GPU detected (compute ${COMPUTE_CAP}) → using CUDA 13.0 paths${NC}"
 fi
 
@@ -537,8 +676,15 @@ fi
 
 # Persistent model cache on remote host — survives across benchmark runs
 MODEL_CACHE_DIR="/opt/puget-model-cache"
-target_cmd "sudo mkdir -p '$MODEL_CACHE_DIR' && sudo chmod 775 '$MODEL_CACHE_DIR'" 2>/dev/null || \
-    target_cmd "mkdir -p '$MODEL_CACHE_DIR'" 2>/dev/null || true
+if ! target_cmd "sudo mkdir -p '$MODEL_CACHE_DIR' && sudo chmod 775 '$MODEL_CACHE_DIR'" 2>/dev/null; then
+    if ! target_cmd "mkdir -p '$MODEL_CACHE_DIR'" 2>/dev/null; then
+        # Use the remote user's home directory (not local $HOME)
+        REMOTE_HOME=$(target_cmd "echo \$HOME" 2>/dev/null)
+        MODEL_CACHE_DIR="${REMOTE_HOME:-/tmp}/puget-model-cache"
+        target_cmd "mkdir -p '$MODEL_CACHE_DIR'" 2>/dev/null || true
+        echo -e "  ${YELLOW}Using fallback cache dir: $MODEL_CACHE_DIR (no sudo for /opt)${NC}"
+    fi
+fi
 
 # System Specs Collection
 TARGET_HOSTNAME=$(target_cmd "hostname -s 2>/dev/null || hostname")
@@ -576,42 +722,40 @@ get_vllm_model_info() {
 }
 
 define_run_all_matrix() {
-    # ── Team LLM (vLLM) — mirrors app-pack vllm_model_select.sh choices 1-8 ───
-    # Choice 1: Qwen 3 8B — always available (16 GB)
-    TEST_MATRIX+=("team_llm|1|Qwen3-8B|16||$CONCURRENCY")
+    # ── Team LLM (vLLM) — GPTQ models (vendor-neutral: NVIDIA/Intel/AMD) ───
 
-    # Choice 2: Qwen 3 32B FP8 (40 GB)
-    if [ "$TOTAL_VRAM" -ge 40 ]; then
-        TEST_MATRIX+=("team_llm|2|Qwen3-32B-FP8|40||$CONCURRENCY")
+    # Choice 1: Qwen 3.6 35B MoE FP16 (unquantized, ~70 GB)
+    if [ "$TOTAL_VRAM" -ge 70 ]; then
+        TEST_MATRIX+=("team_llm|1|Qwen3.6-35B-A3B-FP16|70||$CONCURRENCY")
     fi
 
-    # Choice 3: Qwen 3.5 35B MoE AWQ (22 GB)
+    # Choice 2: Qwen 3.6 27B Dense GPTQ (18 GB)
+    if [ "$TOTAL_VRAM" -ge 18 ]; then
+        TEST_MATRIX+=("team_llm|2|Qwen3.6-27B-Dense-GPTQ|18||$CONCURRENCY")
+    fi
+
+    # Choice 3: Qwen 3.5 35B MoE GPTQ (22 GB)
     if [ "$TOTAL_VRAM" -ge 22 ]; then
-        TEST_MATRIX+=("team_llm|3|Qwen3.5-35B-A3B-AWQ|22||$CONCURRENCY")
+        TEST_MATRIX+=("team_llm|3|Qwen3.5-35B-A3B-GPTQ|22||$CONCURRENCY")
     fi
 
-    # Choice 4: Qwen 3.5 122B MoE AWQ (80 GB)
+    # Choice 4: Qwen 3.5 122B MoE GPTQ (80 GB)
     if [ "$TOTAL_VRAM" -ge 80 ]; then
-        TEST_MATRIX+=("team_llm|4|Qwen3.5-122B-A10B-AWQ|80||$CONCURRENCY")
+        TEST_MATRIX+=("team_llm|4|Qwen3.5-122B-A10B-GPTQ|80||$CONCURRENCY")
     fi
 
-    # Choice 5: DeepSeek R1 70B AWQ (40 GB)
+    # Choice 5: DeepSeek R1 70B GPTQ (40 GB)
     if [ "$TOTAL_VRAM" -ge 40 ]; then
-        TEST_MATRIX+=("team_llm|5|DeepSeek-R1-70B-AWQ|40||$CONCURRENCY")
+        TEST_MATRIX+=("team_llm|5|DeepSeek-R1-70B-GPTQ|40||$CONCURRENCY")
     fi
 
-    # Choice 6: Nemotron 3 Nano 30B NVFP4 (20 GB)
-    TEST_MATRIX+=("team_llm|6|Nemotron3-Nano-30B-NVFP4|20||$CONCURRENCY")
-
-    # Choice 7: Nemotron 3 Super 120B NVFP4 (80 GB)
-    if [ "$TOTAL_VRAM" -ge 80 ]; then
-        TEST_MATRIX+=("team_llm|7|Nemotron3-Super-120B-NVFP4|80||$CONCURRENCY")
-    fi
-
-    # Choice 8: Gemma 4 26B MoE AWQ (20 GB)
+    # Choice 6: Gemma 4 26B MoE GPTQ (20 GB)
     if [ "$TOTAL_VRAM" -ge 20 ]; then
-        TEST_MATRIX+=("team_llm|8|Gemma4-26B-A4B-AWQ|20||$CONCURRENCY")
+        TEST_MATRIX+=("team_llm|6|Gemma4-26B-A4B-GPTQ|20||$CONCURRENCY")
     fi
+
+    # Choice 7: Llama 4 8B FP16 (16 GB)
+    TEST_MATRIX+=("team_llm|7|Llama4-8B-FP16|16||$CONCURRENCY")
 
     # ── Personal LLM (Ollama) — mirrors app-pack ollama_model_select.sh ─────
     TEST_MATRIX+=("personal_llm|1|qwen3:8b|5|qwen3:8b|1")
@@ -934,10 +1078,15 @@ format_duration() {
     else printf '%ds' $s; fi
 }
 
-echo -e "${YELLOW}Clearing shared benchmark caches for a fresh start...${NC}"
-target_cmd "docker run --rm -v shared_vllm_cache:/cache alpine rm -rf /cache/hub/*" 2>/dev/null || true
-target_cmd "docker run --rm -v shared_ollama_data:/data alpine rm -rf /data/*" 2>/dev/null || true
-target_cmd "docker volume prune -f 2>/dev/null; docker image prune -f 2>/dev/null" || true
+if [ "$FRESH_CACHE" = true ]; then
+    echo -e "${YELLOW}Clearing shared benchmark caches (--fresh-cache)...${NC}"
+    target_cmd "docker run --rm -v shared_vllm_cache:/cache alpine rm -rf /cache/hub/*" 2>/dev/null || true
+    target_cmd "docker run --rm -v shared_ollama_data:/data alpine rm -rf /data/*" 2>/dev/null || true
+    target_cmd "docker volume prune -f 2>/dev/null; docker image prune -f 2>/dev/null" || true
+else
+    echo -e "${GREEN}✓ Keeping model caches (use --fresh-cache to clear)${NC}"
+    target_cmd "docker image prune -f 2>/dev/null" || true
+fi
 
 for entry in "${TEST_MATRIX[@]}"; do
     IFS='|' read -r BENCH_PACK BENCH_CHOICE BENCH_MODEL BENCH_MIN_VRAM BENCH_OLLAMA_TAG BENCH_CONCURRENCY <<< "$entry"
@@ -973,22 +1122,50 @@ for entry in "${TEST_MATRIX[@]}"; do
     fi
 
     if [ "$BENCH_PACK" = "team_llm" ]; then
+        # Determine HF_ENDPOINT: bypass caching mirror if HF_TOKEN is present to allow gating auth
+        hf_endpoint_val="${HF_MIRROR}"
+        if [ -n "$HF_TOKEN" ]; then
+            hf_endpoint_val=""
+        fi
         if [[ "$BENCH_CHOICE" == "custom" || ! "$BENCH_CHOICE" =~ ^[0-9]+$ ]]; then
             # Custom model
+            custom_image="latest"
+            custom_mem_util="0.90"
+            if [ "$GPU_VENDOR" = "amd" ]; then
+                custom_image="vllm/vllm-openai-rocm:v0.20.2"
+                if [[ "$BENCH_MODEL" =~ 3[Bb] ]]; then
+                    custom_mem_util="0.50"
+                elif [[ "$BENCH_MODEL" =~ 8[Bb] ]]; then
+                    custom_mem_util="0.65"
+                elif [ "$GPU_COUNT" -gt 1 ]; then
+                    custom_mem_util="0.75"
+                else
+                    custom_mem_util="0.80"
+                fi
+            elif [ "$GPU_VENDOR" = "intel" ]; then
+                custom_image="intel/llm-scaler-vllm:0.14.0-b8.2.1"
+            elif [ "$IS_BLACKWELL" = "true" ]; then
+                # Blackwell (sm_120) needs CUDA 13 kernels — the stable image lacks them.
+                custom_image="vllm/vllm-openai:cu130-nightly"
+            else
+                custom_image="vllm/vllm-openai:latest"
+            fi
+            # Allow forcing a specific GPU count for custom models (e.g. single-GPU TP=1)
+            custom_gpu_count="${GPU_COUNT_OVERRIDE:-$GPU_COUNT}"
             target_cmd "cat > \"$WORK_DIR/.env\"" <<ENVEOF
 MODEL_ID=${BENCH_MODEL}
-VLLM_IMAGE=latest
-GPU_COUNT=${GPU_COUNT}
-GPU_MEMORY_UTILIZATION=0.90
+VLLM_IMAGE=${custom_image}
+GPU_COUNT=${custom_gpu_count}
+GPU_MEMORY_UTILIZATION=${custom_mem_util}
 DTYPE=auto
 REASONING_ARGS=
 TOOL_CALL_ARGS=
-EXTRA_VLLM_ARGS=
+EXTRA_VLLM_ARGS=--enforce-eager
 MAX_CONTEXT=
 CACHE_PROXY=${CACHE_PROXY}
 HTTP_PROXY=${CACHE_PROXY}
 HTTPS_PROXY=${CACHE_PROXY}
-HF_ENDPOINT=${HF_MIRROR}
+HF_ENDPOINT=${hf_endpoint_val}
 HF_TOKEN=${HF_TOKEN}
 HUGGINGFACE_TOKEN=${HF_TOKEN}
 ENVEOF
@@ -996,6 +1173,11 @@ ENVEOF
             vllm_info=$(get_vllm_model_info "$BENCH_CHOICE") || { echo -e "${RED}✗ Required ${BENCH_MIN_VRAM}GB VRAM for choice $BENCH_CHOICE. Skip.${NC}"; continue; }
             IFS='|' read -r status m_id m_img m_gpus m_mem m_dtype m_ctx m_reason m_extra m_tool m_thinking <<< "$vllm_info"
             BENCH_MODEL="$m_id" # update to true ID
+            # Blackwell (sm_120) needs CUDA 13 kernels. Some menu models (DeepSeek 70B,
+            # GPT-OSS) pin the stable v0.20.2 image which lacks them — force cu130-nightly.
+            if [ "$IS_BLACKWELL" = "true" ]; then
+                m_img="vllm/vllm-openai:cu130-nightly"
+            fi
             target_cmd "cat > \"$WORK_DIR/.env\"" <<ENVEOF
 MODEL_ID=${m_id}
 VLLM_IMAGE=${m_img}
@@ -1010,7 +1192,7 @@ THINKING_ARGS=${m_thinking}
 CACHE_PROXY=${CACHE_PROXY}
 HTTP_PROXY=${CACHE_PROXY}
 HTTPS_PROXY=${CACHE_PROXY}
-HF_ENDPOINT=${HF_MIRROR}
+HF_ENDPOINT=${hf_endpoint_val}
 HF_TOKEN=${HF_TOKEN}
 HUGGINGFACE_TOKEN=${HF_TOKEN}
 ENVEOF
@@ -1022,12 +1204,44 @@ ENVEOF
         # The app-pack compose creates a per-project vllm_cache volume; we override
         # it to use a single shared external volume so models download once.
         target_cmd "docker volume create shared_vllm_cache 2>/dev/null || true"
-        _OVERRIDE="services:\n  inference:\n"
+        _ENV=""
         if [ -n "$HF_TOKEN" ]; then
-            _OVERRIDE+="    environment:\n      - HF_TOKEN=${HF_TOKEN}\n      - HUGGINGFACE_TOKEN=${HF_TOKEN}\n      - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN}\n"
+            _ENV+="      - HF_TOKEN=${HF_TOKEN}\n      - HUGGINGFACE_TOKEN=${HF_TOKEN}\n      - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN}\n"
+        fi
+        # AMD ROCm: override NVIDIA deploy block, add device mappings
+        if [ "$GPU_VENDOR" = "amd" ]; then
+            _OVERRIDE="services:\n  inference:\n"
+            _OVERRIDE+="    deploy: {}\n"
+            _OVERRIDE+="    privileged: true\n"
+            _OVERRIDE+="    devices:\n      - /dev/dri:/dev/dri\n      - /dev/kfd:/dev/kfd\n"
+            _ENV+="      - VLLM_TARGET_DEVICE=rocm\n      - NCCL_P2P_DISABLE=1\n      - HIP_FORCE_DEV_KERNARG=1\n"
+        else
+            _OVERRIDE="services:\n  inference:\n"
+        fi
+
+        if [ -n "$_ENV" ]; then
+            _OVERRIDE+="    environment:\n${_ENV}"
         fi
         _OVERRIDE+="volumes:\n  vllm_cache:\n    external: true\n    name: shared_vllm_cache\n"
         target_cmd "printf '${_OVERRIDE}' > \"${WORK_DIR}/docker-compose.override.yml\""
+
+        # AMD ROCm multi-GPU: use Pipeline Parallelism instead of Tensor Parallelism.
+        # vLLM V1's RCCL all-reduce deadlocks on PCIe-connected AMD GPUs during TP.
+        # PP splits layers across GPUs sequentially, avoiding collective ops.
+        # Read GPU_COUNT from the .env (may differ from hardware count for TP=1 models).
+        env_gpu_count=$(target_cmd "grep '^GPU_COUNT=' \"${WORK_DIR}/.env\"" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "1")
+        if [ "$GPU_VENDOR" = "amd" ] && [ "${env_gpu_count:-1}" -gt 1 ]; then
+            echo -e "  ${YELLOW}AMD multi-GPU: switching from TP=${env_gpu_count} to PP=${env_gpu_count} (avoids RCCL deadlock)${NC}"
+            target_cmd "sed -i 's/^EXTRA_VLLM_ARGS=.*/&  --tensor-parallel-size 1 --pipeline-parallel-size ${env_gpu_count}/' \"${WORK_DIR}/.env\""
+            # PP on AMD may leave less room for KV cache. Increase GPU utilization
+            # and cap context length to avoid OOM on large models.
+            target_cmd "sed -i 's/^GPU_MEM_UTIL=.*/GPU_MEM_UTIL=0.95/' \"${WORK_DIR}/.env\"" 2>/dev/null || true
+            env_max_ctx=$(target_cmd "grep '^MAX_CONTEXT=' \"${WORK_DIR}/.env\"" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "0")
+            if [ "${env_max_ctx:-0}" -gt 16384 ]; then
+                echo -e "  ${YELLOW}PP mode: capping MAX_CONTEXT from ${env_max_ctx} to 16384 (KV cache headroom)${NC}"
+                target_cmd "sed -i 's/^MAX_CONTEXT=.*/MAX_CONTEXT=16384/' \"${WORK_DIR}/.env\""
+            fi
+        fi
 
         # Gemma4 AWQ: upstream vLLM lacks packed-expert weight support.
         # The model crashes with KeyError: 'layers.0.moe.experts.0.down_proj_packed'.
@@ -1052,6 +1266,35 @@ ENVEOF
             fi
         fi
 
+        # Ensure the vendor-specific container image is available
+        if [ "$GPU_VENDOR" = "amd" ]; then
+            if ! target_cmd "docker image inspect vllm/vllm-openai-rocm:v0.20.2 >/dev/null 2>&1"; then
+                echo -e "  ${BLUE}Pulling vllm/vllm-openai-rocm:v0.20.2 (first run only)...${NC}"
+                if ! target_cmd "docker pull vllm/vllm-openai-rocm:v0.20.2"; then
+                    echo -e "  ${RED}✗ Failed to pull ROCm container image. Skipping.${NC}"
+                    FAILED_BENCHMARKS+=("${BENCH_MODEL} (ROCm image pull failed)")
+                    _BENCH_ELAPSED=$(( $(date +%s) - _BENCH_START ))
+                    BENCH_TIMINGS+=("${BENCH_PACK}|${BENCH_MODEL}|${_BENCH_ELAPSED}")
+                    continue
+                fi
+            else
+                echo -e "  ${GREEN}✓ vllm/vllm-openai-rocm:v0.20.2 already cached on remote.${NC}"
+            fi
+        elif [ "$GPU_VENDOR" = "intel" ]; then
+            if ! target_cmd "docker image inspect intel/llm-scaler-vllm:0.14.0-b8.2.1 >/dev/null 2>&1"; then
+                echo -e "  ${BLUE}Pulling intel/llm-scaler-vllm:0.14.0-b8.2.1 (first run only)...${NC}"
+                if ! target_cmd "docker pull intel/llm-scaler-vllm:0.14.0-b8.2.1"; then
+                    echo -e "  ${RED}✗ Failed to pull XPU container image. Skipping.${NC}"
+                    FAILED_BENCHMARKS+=("${BENCH_MODEL} (XPU image pull failed)")
+                    _BENCH_ELAPSED=$(( $(date +%s) - _BENCH_START ))
+                    BENCH_TIMINGS+=("${BENCH_PACK}|${BENCH_MODEL}|${_BENCH_ELAPSED}")
+                    continue
+                fi
+            else
+                echo -e "  ${GREEN}✓ intel/llm-scaler-vllm:0.14.0-b8.2.1 already cached on remote.${NC}"
+            fi
+        fi
+
         target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null; docker compose up -d"
         echo ""
 
@@ -1068,25 +1311,38 @@ ENVEOF
 
         API_MODEL=$(target_cmd "curl -s http://localhost:8000/v1/models 2>/dev/null | grep -o '\"id\":\"[^\"]*' | head -n 1 | cut -d'\"' -f4" || echo "$BENCH_MODEL")
 
+        echo -e "  ${YELLOW}Pre-warming model to trigger Triton JIT compile...${NC}"
+        target_cmd "curl -s -X POST http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\": \"$API_MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"Pre-warmup: Puget Systems.\"}], \"max_tokens\": 50}' >/dev/null" || true
+
         echo ""
+        start_power_monitor 2
         if ! run_genai_perf_client "vllm" "${BENCH_URL_BASE}:8000" "$API_MODEL" "$BENCH_CONCURRENCY" "$BENCH_RESULTS_DIR"; then
             echo -e "  ${RED}✗ genai-perf failed for ${BENCH_MODEL}${NC}"
             echo -e "  ${YELLOW}Capturing vLLM logs for debugging...${NC}"
             target_cmd "cd \"$WORK_DIR\" && docker compose logs --tail 200 > /tmp/vllm_error_${BENCH_MODEL//\//_}.log"
             FAILED_BENCHMARKS+=("${BENCH_MODEL} (genai-perf failed)")
         fi
+        stop_power_monitor "$BENCH_RESULTS_DIR"
 
-        target_cmd "cd \"$WORK_DIR\" && docker compose down -v 2>/dev/null"
-        # Prune specific model from shared cache to save disk (Prune-as-you-go)
-        HF_CACHE_DIR="models--$(echo "$BENCH_MODEL" | sed 's/\//--/g')"
-        echo -e "  ${BLUE}Pruning $BENCH_MODEL from shared vLLM cache...${NC}"
-        target_cmd "docker run --rm -v shared_vllm_cache:/cache alpine rm -rf \"/cache/hub/$HF_CACHE_DIR\"" 2>/dev/null || true
+        # target_cmd "cd \"$WORK_DIR\" && docker compose down -v 2>/dev/null"
+        # Optionally prune model from shared cache to save disk
+        if [ "$FRESH_CACHE" = true ]; then
+            HF_CACHE_DIR="models--$(echo "$BENCH_MODEL" | sed 's/\//--/g')"
+            echo -e "  ${BLUE}Pruning $BENCH_MODEL from shared vLLM cache...${NC}"
+            target_cmd "docker run --rm -v shared_vllm_cache:/cache alpine rm -rf \"/cache/hub/$HF_CACHE_DIR\"" 2>/dev/null || true
+        fi
         # Prune per-benchmark volumes (open_webui_data) and dangling images to reclaim disk
         target_cmd "docker volume prune -f 2>/dev/null; docker image prune -f 2>/dev/null" || true
 
     elif [ "$BENCH_PACK" = "personal_llm" ]; then
+        # AMD ROCm: use the official Ollama ROCm image
+        _OLLAMA_IMG=""
+        if [ "$GPU_VENDOR" = "amd" ]; then
+            _OLLAMA_IMG="OLLAMA_IMAGE=ollama/ollama:rocm"
+        fi
         target_cmd "cat > \"$WORK_DIR/.env\"" <<ENVEOF
 PUGET_APP_NAME=puget-bench-ollama
+${_OLLAMA_IMG}
 CACHE_PROXY=${CACHE_PROXY}
 HTTP_PROXY=${CACHE_PROXY}
 HTTPS_PROXY=${CACHE_PROXY}
@@ -1096,7 +1352,13 @@ ENVEOF
         echo -e "  ${BLUE}Starting Ollama on remote server...${NC}"
         # Share a single Ollama data volume across all personal_llm benchmarks
         target_cmd "docker volume create shared_ollama_data 2>/dev/null || true"
-        _OL_OVERRIDE="volumes:\n  ollama_data:\n    external: true\n    name: shared_ollama_data\n"
+        _OL_OVERRIDE="services:\n  inference:\n"
+        # AMD ROCm: override NVIDIA deploy block, add device mappings
+        if [ "$GPU_VENDOR" = "amd" ]; then
+            _OL_OVERRIDE+="    deploy: {}\n"
+            _OL_OVERRIDE+="    devices:\n      - /dev/dri:/dev/dri\n      - /dev/kfd:/dev/kfd\n"
+        fi
+        _OL_OVERRIDE+="volumes:\n  ollama_data:\n    external: true\n    name: shared_ollama_data\n"
         target_cmd "printf '${_OL_OVERRIDE}' > \"${WORK_DIR}/docker-compose.override.yml\""
         # Pull the latest Ollama image before starting — prevents 412 manifest
         # errors when pulling newer models that require a newer Ollama version.
@@ -1214,6 +1476,15 @@ ENVEOF
         # Pin numpy<2.4 in the Dockerfile before PyTorch install picks up an incompatible version
         target_cmd "grep -q 'numpy<2.4' \"$COMFY_WORK_DIR/Dockerfile\" || sed -i '/^RUN pip install.*torch.*torchvision/i RUN pip install --no-cache-dir \"numpy<2.4\"' \"$COMFY_WORK_DIR/Dockerfile\""
 
+        # AMD ROCm: use Dockerfile.rocm and inject device mappings
+        if [ "$GPU_VENDOR" = "amd" ]; then
+            target_cmd "cat > \"$COMFY_WORK_DIR/.env\"" <<COMFYENV
+DOCKERFILE=Dockerfile.rocm
+COMFYENV
+            _COMFY_OVERRIDE="services:\n  app:\n    deploy: {}\n    user: root\n    privileged: true\n    devices:\n      - /dev/dri:/dev/dri\n      - /dev/kfd:/dev/kfd\n    environment:\n      - CLI_ARGS=--listen 0.0.0.0 --preview-method auto\n"
+            target_cmd "printf '${_COMFY_OVERRIDE}' > \"${COMFY_WORK_DIR}/docker-compose.override.yml\""
+        fi
+
         # Build container (smart_build skips if fingerprint unchanged)
         echo -e "  ${BLUE}Building ComfyUI container on remote server (smart build)...${NC}"
         target_cmd "bash -c 'source \"$COMFY_WORK_DIR/scripts/lib/smart_build.sh\" && cd \"$COMFY_WORK_DIR\" && smart_build'"
@@ -1275,7 +1546,7 @@ echo ""
 echo -e "${BLUE}  Per-benchmark timing:${NC}"
 printf '  %-15s %-35s %s\n' 'Pack' 'Model' 'Time'
 printf '  %-15s %-35s %s\n' '───────────────' '───────────────────────────────────' '──────────'
-for _t in "${BENCH_TIMINGS[@]}"; do
+for _t in ${BENCH_TIMINGS[@]+"${BENCH_TIMINGS[@]}"}; do
     IFS='|' read -r _tp _tm _ts <<< "$_t"
     printf '  %-15s %-35s %s\n' "$_tp" "$_tm" "$(format_duration $_ts)"
 done
@@ -1283,7 +1554,7 @@ done
 if [ ${#FAILED_BENCHMARKS[@]} -gt 0 ]; then
     echo ""
     echo -e "${RED}The following benchmarks FAILED:${NC}"
-    for fail in "${FAILED_BENCHMARKS[@]}"; do
+    for fail in ${FAILED_BENCHMARKS[@]+"${FAILED_BENCHMARKS[@]}"}; do
         echo -e "  ${RED}• $fail${NC}"
     done
     echo ""

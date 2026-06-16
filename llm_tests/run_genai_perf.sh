@@ -17,6 +17,8 @@ RESULTS_DIR=""
 URL=""
 CONTEXT_LENGTHS=""  # Comma-separated list of input token sizes (e.g. "4096,32768,131072")
                     # When set, overrides INPUT_TOKENS and runs a separate pass per size.
+MEASUREMENT_INTERVAL=30000
+REQUEST_TIMEOUT=""  # Per-request timeout in seconds (for thinking/reasoning models)
 
 # Triton SDK image — update this to the latest available on nvcr.io
 TRITON_SDK_IMAGE="nvcr.io/nvidia/tritonserver:25.04-py3-sdk"
@@ -24,16 +26,18 @@ TRITON_SDK_IMAGE="nvcr.io/nvidia/tritonserver:25.04-py3-sdk"
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
-        --endpoint)        ENDPOINT="$2";        shift ;;
-        --model)           MODEL_NAME="$2";       shift ;;
-        --url)             URL="$2";              shift ;;
-        --concurrency)     CONCURRENCY_LIST="$2"; shift ;;
-        --input-tokens)    INPUT_TOKENS="$2";     shift ;;
-        --output-tokens)   OUTPUT_TOKENS="$2";    shift ;;
-        --num-prompts)     NUM_PROMPTS="$2";      shift ;;
-        --results-dir)     RESULTS_DIR="$2";      shift ;;
-        --context-lengths) CONTEXT_LENGTHS="$2";  shift ;;
-        --sdk-image)       TRITON_SDK_IMAGE="$2"; shift ;;
+        --endpoint)             ENDPOINT="$2";             shift ;;
+        --model)                MODEL_NAME="$2";           shift ;;
+        --url)                  URL="$2";                  shift ;;
+        --concurrency)          CONCURRENCY_LIST="$2";     shift ;;
+        --input-tokens)         INPUT_TOKENS="$2";         shift ;;
+        --output-tokens)        OUTPUT_TOKENS="$2";        shift ;;
+        --num-prompts)          NUM_PROMPTS="$2";          shift ;;
+        --results-dir)          RESULTS_DIR="$2";          shift ;;
+        --context-lengths)      CONTEXT_LENGTHS="$2";      shift ;;
+        --sdk-image)            TRITON_SDK_IMAGE="$2";     shift ;;
+        --measurement-interval) MEASUREMENT_INTERVAL="$2"; shift ;;
+        --request-timeout)      REQUEST_TIMEOUT="$2";      shift ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift
@@ -98,6 +102,9 @@ if [ -n "$CONTEXT_LENGTHS" ]; then
 else
     echo "  Input Tokens:      $INPUT_TOKENS"
 fi
+if [ -n "$REQUEST_TIMEOUT" ]; then
+    echo "  Request Timeout:   ${REQUEST_TIMEOUT}s (extended for thinking models)"
+fi
 echo "  Results dir:       $RESULTS_DIR"
 echo "=============================================="
 
@@ -132,21 +139,26 @@ for CTX in "${CTX_LIST[@]}"; do
         # shellcheck disable=SC2086
         docker run --rm --net=host \
             -e NVIDIA_DISABLE_REQUIRE=1 \
+            -e HF_TOKEN \
+            -e HUGGINGFACE_HUB_TOKEN \
+            -e HF_ENDPOINT \
             -v "$RESULTS_DIR:/work/results" \
             -w /work \
             "$TRITON_SDK_IMAGE" \
             genai-perf profile \
             -m "$MODEL_NAME" \
             --endpoint-type chat \
+            --streaming \
             -u "$URL" \
             --num-prompts "$NUM_PROMPTS" \
             --synthetic-input-tokens-mean "$CTX" \
             --output-tokens-mean "$OUTPUT_TOKENS" \
             --concurrency "$CONC" \
             --artifact-dir "results/${ARTIFACT_SUBDIR}" \
-            --measurement-interval 120000 \
+            --measurement-interval "$MEASUREMENT_INTERVAL" \
             --stability-percentage 999 \
-            $TOKENIZER_ARG
+            $TOKENIZER_ARG \
+            -- --max-trials 3
 
         echo "  Done: concurrency=${CONC}, input_tokens=${CTX}"
     done
