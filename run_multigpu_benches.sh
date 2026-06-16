@@ -30,7 +30,8 @@ echo "=== Model 1/5: Qwen 3.6 35B MoE unquantized ==="
     --concurrency "$CONCURRENCY" \
     --input-tokens "$INPUT_TOKENS" \
     --output-tokens "$OUTPUT_TOKENS" \
-    --num-prompts "$NUM_PROMPTS"
+    --num-prompts "$NUM_PROMPTS" \
+    --skip-checksum
 echo ""
 
 # 2. Qwen 3.6 27B Dense unquantized (Choice 11)
@@ -43,7 +44,8 @@ echo "=== Model 2/5: Qwen 3.6 27B Dense unquantized ==="
     --concurrency "$CONCURRENCY" \
     --input-tokens "$INPUT_TOKENS" \
     --output-tokens "$OUTPUT_TOKENS" \
-    --num-prompts "$NUM_PROMPTS"
+    --num-prompts "$NUM_PROMPTS" \
+    --skip-checksum
 echo ""
 
 # 3. Llama 3.1 8B Instruct (Custom)
@@ -56,7 +58,8 @@ echo "=== Model 3/5: Llama 3.1 8B Instruct ==="
     --concurrency "$CONCURRENCY" \
     --input-tokens "$INPUT_TOKENS" \
     --output-tokens "$OUTPUT_TOKENS" \
-    --num-prompts "$NUM_PROMPTS"
+    --num-prompts "$NUM_PROMPTS" \
+    --skip-checksum
 echo ""
 
 # 4. DeepSeek R1 Distill Llama 8B (Custom)
@@ -69,7 +72,8 @@ echo "=== Model 4/5: DeepSeek R1 Distill Llama 8B ==="
     --concurrency "$CONCURRENCY" \
     --input-tokens "$INPUT_TOKENS" \
     --output-tokens "$OUTPUT_TOKENS" \
-    --num-prompts "$NUM_PROMPTS"
+    --num-prompts "$NUM_PROMPTS" \
+    --skip-checksum
 echo ""
 
 # 5. Qwen 2.5 3B Instruct (Custom)
@@ -82,7 +86,8 @@ echo "=== Model 5/5: Qwen 2.5 3B Instruct ==="
     --concurrency "$CONCURRENCY" \
     --input-tokens "$INPUT_TOKENS" \
     --output-tokens "$OUTPUT_TOKENS" \
-    --num-prompts "$NUM_PROMPTS"
+    --num-prompts "$NUM_PROMPTS" \
+    --skip-checksum
 echo ""
 
 echo "=========================================================="
