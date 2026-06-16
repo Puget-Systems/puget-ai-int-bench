@@ -1,45 +1,43 @@
 #!/bin/bash
-# Qwen3 8B Thinking Model — Extended Timeout Benchmark
-# Re-runs Qwen3 8B with measurement interval extended to properly
-# capture reasoning/thinking model behavior.
+# Driver script: single-GPU Qwen3-8B (TP=1) on one B70, for the article's
+# single-GPU table. Qwen3 is a thinking model — its reasoning phase emits many
+# internal tokens before visible output, so a 30s measurement window can show
+# 0 tok/s at concurrency=1. We use a 120s window and fewer prompts.
 #
-# The standard 30s measurement window causes concurrency=1 to show 0.0 tok/s
-# because Qwen3's thinking phase generates hundreds of internal tokens before
-# any visible output arrives. This script uses 120s measurement to let the
-# thinking phase complete within the measurement window.
+# Explicit HF ID (custom path) → intel/llm-scaler-vllm image. --gpu-count 1
+# forces TP=1 (single card). XPU vLLM needs --dtype float16 (no bfloat16).
 
-set -euo pipefail
+set -uo pipefail
 
 HOST="labs@172.19.28.207"
 REPO="/Users/dustmoo/Sites/puget-docker-app-pack"
 
 echo "==========================================================="
-echo "Qwen3 8B Thinking Model — Extended Timeout Benchmark"
+echo "Qwen3-8B Single-GPU (TP=1) — Extended Measurement Window"
 echo "Target Host: $HOST"
+echo "  • gpu-count:            1 (single B70, TP=1)"
+echo "  • dtype:                float16"
+echo "  • measurement-interval: 120000ms (thinking model)"
+echo "  • num-prompts:          20    concurrency: 1,4,8"
 echo "==========================================================="
 echo ""
-echo "Key differences from standard run:"
-echo "  • measurement-interval: 120000ms (2 min, was 30000ms)"
-echo "  • num-prompts:          20       (was 50, each takes longer)"
-echo "  • output-tokens:        500      (standard)"
-echo "  • concurrency:          1,4,8    (standard)"
-echo ""
 
-# Qwen3 8B Dense FP16 (TP=1, single GPU) — model choice 10
-echo "=== Qwen3 8B Dense (TP=1) — Extended Measurement Window ==="
 ./run_benchmarks.sh \
     --host "$HOST" \
     --repo "$REPO" \
     --pack team_llm \
-    --model 10 \
+    --model Qwen/Qwen3-8B \
+    --gpu-count 1 \
     --concurrency "1,4,8" \
     --input-tokens 500 \
     --output-tokens 500 \
     --num-prompts 20 \
+    --dtype float16 \
+    --max-model-len 32768 \
     --measurement-interval 120000 \
     --skip-checksum
-echo ""
 
+echo ""
 echo "==========================================================="
-echo "Qwen3 Thinking Benchmark Complete!"
+echo "Qwen3-8B Single-GPU Benchmark Complete!"
 echo "==========================================================="

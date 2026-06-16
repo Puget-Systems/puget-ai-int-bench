@@ -57,6 +57,8 @@ NO_LOCAL_DOCKER=false  # Set by local preflight if Docker is unavailable
 FRESH_CACHE=false      # If true, clear model caches before running (default: keep cache)
 REQUEST_TIMEOUT=""     # Per-request timeout (seconds) for genai-perf — extend for thinking models
 GPU_COUNT_OVERRIDE=""  # Force a specific GPU count for custom models (e.g. 1 = single-GPU TP=1)
+DTYPE_OVERRIDE=""      # Force model dtype (e.g. float16 — Intel XPU vLLM cannot serve bfloat16)
+MAX_MODEL_LEN=""       # Cap vLLM --max-model-len (KV-cache headroom for large-context models)
 
 # ============================================
 # Load Config File (if exists)
@@ -99,6 +101,8 @@ while [[ "$#" -gt 0 ]]; do
         --sudo-pass) SUDO_PASS="$2"; shift ;;
         --request-timeout) REQUEST_TIMEOUT="$2"; shift ;;
         --gpu-count) GPU_COUNT_OVERRIDE="$2"; shift ;;
+        --dtype) DTYPE_OVERRIDE="$2"; shift ;;
+        --max-model-len) MAX_MODEL_LEN="$2"; shift ;;
         -h|--help)
             echo -e "${BLUE}Puget Systems AI App Pack — Automated Benchmark Suite${NC}"
             echo ""
@@ -1157,11 +1161,11 @@ MODEL_ID=${BENCH_MODEL}
 VLLM_IMAGE=${custom_image}
 GPU_COUNT=${custom_gpu_count}
 GPU_MEMORY_UTILIZATION=${custom_mem_util}
-DTYPE=auto
+DTYPE=${DTYPE_OVERRIDE:-auto}
 REASONING_ARGS=
 TOOL_CALL_ARGS=
 EXTRA_VLLM_ARGS=--enforce-eager
-MAX_CONTEXT=
+MAX_CONTEXT=${MAX_MODEL_LEN}
 CACHE_PROXY=${CACHE_PROXY}
 HTTP_PROXY=${CACHE_PROXY}
 HTTPS_PROXY=${CACHE_PROXY}
@@ -1183,8 +1187,8 @@ MODEL_ID=${m_id}
 VLLM_IMAGE=${m_img}
 GPU_COUNT=${m_gpus}
 GPU_MEMORY_UTILIZATION=${m_mem}
-DTYPE=${m_dtype}
-MAX_CONTEXT=${m_ctx}
+DTYPE=${DTYPE_OVERRIDE:-${m_dtype}}
+MAX_CONTEXT=${MAX_MODEL_LEN:-${m_ctx}}
 REASONING_ARGS=${m_reason}
 EXTRA_VLLM_ARGS=${m_extra}
 TOOL_CALL_ARGS=${m_tool}
