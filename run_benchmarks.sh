@@ -1299,7 +1299,11 @@ ENVEOF
             fi
         fi
 
-        target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null; docker compose up -d"
+        # Only start the vLLM inference service. The team_llm pack also defines
+        # 'ui' (open-webui) and 'brain' (autogen, slow build) services that the
+        # benchmark never touches — starting them rebuilds the autogen image on
+        # every model. genai-perf hits inference:8000 directly.
+        target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null; docker compose up -d inference"
         echo ""
 
         echo -e "  ${YELLOW}Waiting for model to load by invoking vllm_monitor remotely...${NC}"
