@@ -187,6 +187,61 @@ pull_dir() {
     fi
 }
 
+# ensure_vllm_image IMG — guarantee the vLLM container image exists on the target.
+# Build-required puget-* images are built from their Dockerfile in $WORK_DIR (same
+# as the App Pack installer does); everything else is pulled. Returns non-zero on
+# failure so the caller can record a SKIP/FAIL and move on. This replaces the old
+# hardcoded per-vendor pull that ignored the image the model menu actually selected.
+ensure_vllm_image() {
+    local img="$1"
+    if [ -z "$img" ]; then
+        echo -e "  ${RED}✗ No container image resolved for this model.${NC}"; return 1
+    fi
+    if target_cmd "docker image inspect '$img' >/dev/null 2>&1"; then
+        echo -e "  ${GREEN}✓ Image present: ${img}${NC}"; return 0
+    fi
+    case "$img" in
+        puget-vllm-xpu*)
+            echo -e "  ${BLUE}Building ${img} from Dockerfile.xpu (first run; a few minutes)...${NC}"
+            if ! target_cmd "cd \"$WORK_DIR\" && docker build -t '$img' -f Dockerfile.xpu ."; then
+                echo -e "  ${RED}✗ Failed to build ${img}.${NC}"; return 1
+            fi ;;
+        puget-*)
+            echo -e "  ${RED}✗ Build-required image with no known Dockerfile mapping: ${img}${NC}"; return 1 ;;
+        *)
+            echo -e "  ${BLUE}Pulling ${img} (first run only)...${NC}"
+            if ! target_cmd "docker pull '$img'"; then
+                echo -e "  ${RED}✗ Failed to pull ${img}.${NC}"; return 1
+            fi ;;
+    esac
+    return 0
+}
+
+# reap_workers_and_wait_gpu — a plain `docker compose down` can leave orphaned
+# vLLM worker processes behind (the spawn multiproc method detaches EngineCore /
+# TP workers) that keep holding GPU memory and port 8000, wedging the next model.
+# Kill any strays, free the port, and wait until the GPUs report idle. Vendor-
+# neutral: precise compute-process check on NVIDIA, vLLM-process proxy elsewhere.
+reap_workers_and_wait_gpu() {
+    target_cmd "pkill -9 -f 'vllm.entrypoints' 2>/dev/null; pkill -9 -f 'multiprocessing.spawn' 2>/dev/null; fuser -k 8000/tcp 2>/dev/null; true" 2>/dev/null || true
+    local waited=0 max=90
+    while [ "$waited" -lt "$max" ]; do
+        if target_cmd "
+            if command -v nvidia-smi >/dev/null 2>&1; then
+                [ -z \"\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null)\" ]
+            else
+                ! pgrep -f 'vllm' >/dev/null 2>&1
+            fi
+        " 2>/dev/null; then
+            [ "$waited" -gt 0 ] && echo -e "  ${GREEN}✓ GPUs free.${NC}"
+            return 0
+        fi
+        sleep 3; waited=$((waited + 3))
+    done
+    echo -e "  ${YELLOW}⚠ GPUs still showing activity after ${max}s — continuing.${NC}"
+    return 0
+}
+
 # ============================================
 # GPU Power Monitoring
 # ============================================
@@ -1122,7 +1177,8 @@ echo ""
 
 BENCH_COUNT=0
 BENCH_TOTAL=${#TEST_MATRIX[@]}
-FAILED_BENCHMARKS=()
+FAILED_BENCHMARKS=()      # FAIL/SKIP entries, each "model (reason)"
+PASSED_BENCHMARKS=()      # models that completed cleanly, each "pack|model"
 SUITE_START_EPOCH=$(date +%s)
 declare -a BENCH_TIMINGS=()
 
@@ -1149,6 +1205,7 @@ fi
 for entry in "${TEST_MATRIX[@]}"; do
     IFS='|' read -r BENCH_PACK BENCH_CHOICE BENCH_MODEL BENCH_MIN_VRAM BENCH_OLLAMA_TAG BENCH_CONCURRENCY <<< "$entry"
     BENCH_COUNT=$((BENCH_COUNT + 1))
+    BENCH_OK=true   # set false on any non-fatal failure that still reaches loop end
 
     _BENCH_START=$(date +%s)
 
@@ -1166,8 +1223,11 @@ for entry in "${TEST_MATRIX[@]}"; do
         continue
     fi
 
-    # Pre-flight: forcibly remove any stale bench containers left by aborted prior runs
+    # Pre-flight: forcibly remove any stale bench containers left by aborted prior
+    # runs, reap orphaned vLLM workers, and wait for the GPUs to be free so the
+    # next model starts from a clean slate (prevents OOM / port-in-use wedges).
     target_cmd "docker rm -f puget_vllm puget_team_brain puget_team_webui puget_ollama 2>/dev/null; docker network prune -f 2>/dev/null" || true
+    reap_workers_and_wait_gpu
 
     SAFE_MODEL_NAME=$(echo "$BENCH_MODEL" | tr '/:' '_')
     BENCH_RESULTS_DIR="$MASTER_RESULTS_DIR/${BENCH_PACK}_${SAFE_MODEL_NAME}"
@@ -1324,33 +1384,16 @@ ENVEOF
             fi
         fi
 
-        # Ensure the vendor-specific container image is available
-        if [ "$GPU_VENDOR" = "amd" ]; then
-            if ! target_cmd "docker image inspect vllm/vllm-openai-rocm:v0.20.2 >/dev/null 2>&1"; then
-                echo -e "  ${BLUE}Pulling vllm/vllm-openai-rocm:v0.20.2 (first run only)...${NC}"
-                if ! target_cmd "docker pull vllm/vllm-openai-rocm:v0.20.2"; then
-                    echo -e "  ${RED}✗ Failed to pull ROCm container image. Skipping.${NC}"
-                    FAILED_BENCHMARKS+=("${BENCH_MODEL} (ROCm image pull failed)")
-                    _BENCH_ELAPSED=$(( $(date +%s) - _BENCH_START ))
-                    BENCH_TIMINGS+=("${BENCH_PACK}|${BENCH_MODEL}|${_BENCH_ELAPSED}")
-                    continue
-                fi
-            else
-                echo -e "  ${GREEN}✓ vllm/vllm-openai-rocm:v0.20.2 already cached on the target.${NC}"
-            fi
-        elif [ "$GPU_VENDOR" = "intel" ]; then
-            if ! target_cmd "docker image inspect intel/llm-scaler-vllm:0.14.0-b8.2.1 >/dev/null 2>&1"; then
-                echo -e "  ${BLUE}Pulling intel/llm-scaler-vllm:0.14.0-b8.2.1 (first run only)...${NC}"
-                if ! target_cmd "docker pull intel/llm-scaler-vllm:0.14.0-b8.2.1"; then
-                    echo -e "  ${RED}✗ Failed to pull XPU container image. Skipping.${NC}"
-                    FAILED_BENCHMARKS+=("${BENCH_MODEL} (XPU image pull failed)")
-                    _BENCH_ELAPSED=$(( $(date +%s) - _BENCH_START ))
-                    BENCH_TIMINGS+=("${BENCH_PACK}|${BENCH_MODEL}|${_BENCH_ELAPSED}")
-                    continue
-                fi
-            else
-                echo -e "  ${GREEN}✓ intel/llm-scaler-vllm:0.14.0-b8.2.1 already cached on the target.${NC}"
-            fi
+        # Ensure the container image the model menu selected is present on the
+        # target — build puget-* images from their Dockerfile, pull the rest.
+        # This honors VLLM_IMAGE from the .env we just wrote (the old code
+        # hardcoded the base image and ignored the menu's choice).
+        EFFECTIVE_IMG=$(target_cmd "grep -m1 '^VLLM_IMAGE=' \"$WORK_DIR/.env\" | cut -d= -f2-" 2>/dev/null)
+        if ! ensure_vllm_image "$EFFECTIVE_IMG"; then
+            FAILED_BENCHMARKS+=("${BENCH_MODEL} (image unavailable: ${EFFECTIVE_IMG:-none})")
+            _BENCH_ELAPSED=$(( $(date +%s) - _BENCH_START ))
+            BENCH_TIMINGS+=("${BENCH_PACK}|${BENCH_MODEL}|${_BENCH_ELAPSED}")
+            continue
         fi
 
         # Only start the vLLM inference service. The team_llm pack also defines
@@ -1383,10 +1426,15 @@ ENVEOF
             echo -e "  ${YELLOW}Capturing vLLM logs for debugging...${NC}"
             target_cmd "cd \"$WORK_DIR\" && docker compose logs --tail 200 > /tmp/vllm_error_${BENCH_MODEL//\//_}.log"
             FAILED_BENCHMARKS+=("${BENCH_MODEL} (genai-perf failed)")
+            BENCH_OK=false
         fi
         stop_power_monitor "$BENCH_RESULTS_DIR"
 
-        # target_cmd "cd \"$WORK_DIR\" && docker compose down -v 2>/dev/null"
+        # Tear down this model and free the GPUs before the next one. Plain `down`
+        # keeps the external shared_vllm_cache volume (model weights) intact.
+        target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null" || true
+        reap_workers_and_wait_gpu
+
         # Optionally prune model from shared cache to save disk
         if [ "$FRESH_CACHE" = true ]; then
             HF_CACHE_DIR="models--$(echo "$BENCH_MODEL" | sed 's/\//--/g')"
@@ -1464,6 +1512,7 @@ ENVEOF
              echo -e "  ${RED}✗ genai-perf failed for ${BENCH_OLLAMA_TAG}${NC}"
              target_cmd "cd \"$WORK_DIR\" && docker compose logs --tail 200 > /tmp/ollama_error_${BENCH_MODEL//\//_}.log"
              FAILED_BENCHMARKS+=("${BENCH_OLLAMA_TAG} (genai-perf failed)")
+             BENCH_OK=false
         fi
 
         # Prune specific model from Ollama to save disk
@@ -1573,6 +1622,7 @@ COMFYENV
         if ! run_comfyui_bench_client "$BENCH_CHOICE" "${BENCH_URL_BASE}:8188" "$BENCH_RESULTS_DIR"; then
             echo -e "  ${RED}✗ ComfyUI benchmark failed for ${BENCH_MODEL}${NC}"
             FAILED_BENCHMARKS+=("${BENCH_MODEL} (benchmark failed)")
+            BENCH_OK=false
         fi
 
         target_cmd "cd \"$COMFY_WORK_DIR\" && docker compose down -v 2>/dev/null"
@@ -1583,6 +1633,9 @@ COMFYENV
     fi
     _BENCH_ELAPSED=$(( $(date +%s) - _BENCH_START ))
     BENCH_TIMINGS+=("${BENCH_PACK}|${BENCH_MODEL}|${_BENCH_ELAPSED}")
+    if [ "$BENCH_OK" = true ]; then
+        PASSED_BENCHMARKS+=("${BENCH_PACK}|${BENCH_MODEL}")
+    fi
     echo -e "  ${GREEN}⏱  ${BENCH_PACK} → ${BENCH_MODEL}: $(format_duration $_BENCH_ELAPSED)${NC}"
     echo ""
 done
@@ -1613,11 +1666,24 @@ for _t in ${BENCH_TIMINGS[@]+"${BENCH_TIMINGS[@]}"}; do
     printf '  %-15s %-35s %s\n' "$_tp" "$_tm" "$(format_duration $_ts)"
 done
 
-if [ ${#FAILED_BENCHMARKS[@]} -gt 0 ]; then
-    echo ""
-    echo -e "${RED}The following benchmarks FAILED:${NC}"
-    for fail in ${FAILED_BENCHMARKS[@]+"${FAILED_BENCHMARKS[@]}"}; do
-        echo -e "  ${RED}• $fail${NC}"
-    done
-    echo ""
-fi
+# ── Per-model status: PASS / FAIL / SKIP ──────────────────────────────────
+echo ""
+echo -e "${BLUE}  Status:${NC}"
+_fail_n=0; _skip_n=0
+_pass_n=${#PASSED_BENCHMARKS[@]}
+for p in ${PASSED_BENCHMARKS[@]+"${PASSED_BENCHMARKS[@]}"}; do
+    IFS='|' read -r _pp _pm <<< "$p"
+    printf '    %bPASS%b  %-13s %s\n' "$GREEN" "$NC" "$_pp" "$_pm"
+done
+for fail in ${FAILED_BENCHMARKS[@]+"${FAILED_BENCHMARKS[@]}"}; do
+    if echo "$fail" | grep -qiE "skip|unsupported"; then
+        _skip_n=$((_skip_n + 1))
+        printf '    %bSKIP%b  %s\n' "$YELLOW" "$NC" "$fail"
+    else
+        _fail_n=$((_fail_n + 1))
+        printf '    %bFAIL%b  %s\n' "$RED" "$NC" "$fail"
+    fi
+done
+echo ""
+echo -e "  ${GREEN}${_pass_n} passed${NC}, ${RED}${_fail_n} failed${NC}, ${YELLOW}${_skip_n} skipped${NC} of ${BENCH_TOTAL} planned."
+echo ""
