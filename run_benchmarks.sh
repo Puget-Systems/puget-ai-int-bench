@@ -410,9 +410,13 @@ run_genai_perf_client() {
     fi
 
     local exit_code=0
-    # HF_TOKEN/HF_ENDPOINT are exported into the remote shell so run_genai_perf.sh
-    # can forward them into the SDK container for tokenizer downloads (gated models).
-    target_cmd "export HF_TOKEN='${HF_TOKEN}' HUGGINGFACE_HUB_TOKEN='${HF_TOKEN}' HF_ENDPOINT='${HF_MIRROR:-}'; bash '$REMOTE_TEMP_DIR/run_genai_perf.sh' \
+    # HF_TOKEN/HF_ENDPOINT are exported into the shell so run_genai_perf.sh can
+    # forward them into the SDK container for tokenizer downloads. Only set
+    # HF_ENDPOINT when a mirror exists — exporting it empty makes transformers use
+    # "" as the endpoint and the tokenizer download fails ("Unrecognized model").
+    local hf_env="HF_TOKEN='${HF_TOKEN}' HUGGINGFACE_HUB_TOKEN='${HF_TOKEN}'"
+    [ -n "${HF_MIRROR:-}" ] && hf_env="$hf_env HF_ENDPOINT='${HF_MIRROR}'"
+    target_cmd "export $hf_env; bash '$REMOTE_TEMP_DIR/run_genai_perf.sh' \
         --endpoint '$endpoint' \
         --url 'http://localhost:$port' \
         --model '$model' \
