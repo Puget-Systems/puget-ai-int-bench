@@ -230,7 +230,9 @@ reap_workers_and_wait_gpu() {
             if command -v nvidia-smi >/dev/null 2>&1; then
                 [ -z \"\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null)\" ]
             else
-                ! pgrep -f 'vllm' >/dev/null 2>&1
+                # Non-NVIDIA: match only the actual vLLM server, not the bench's own
+                # processes/paths that merely contain the string 'vllm'.
+                ! pgrep -f 'vllm\\.entrypoints' >/dev/null 2>&1
             fi
         " 2>/dev/null; then
             [ "$waited" -gt 0 ] && echo -e "  ${GREEN}✓ GPUs free.${NC}"
