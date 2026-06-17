@@ -49,6 +49,7 @@ INPUT_TOKENS=500
 OUTPUT_TOKENS=500
 NUM_PROMPTS=50
 MEASUREMENT_INTERVAL=30000
+MEASUREMENT_INTERVAL_SET=false   # true once the user passes --measurement-interval
 COMFY_ITERATIONS=10
 CONTEXT_LENGTHS=""  # e.g. "4096,32768,131072" — empty = use INPUT_TOKENS only
 SKIP_CHECKSUM=false
@@ -92,7 +93,7 @@ while [[ "$#" -gt 0 ]]; do
         --input-tokens) INPUT_TOKENS="$2"; shift ;;
         --output-tokens) OUTPUT_TOKENS="$2"; shift ;;
         --num-prompts) NUM_PROMPTS="$2"; shift ;;
-        --measurement-interval) MEASUREMENT_INTERVAL="$2"; shift ;;
+        --measurement-interval) MEASUREMENT_INTERVAL="$2"; MEASUREMENT_INTERVAL_SET=true; shift ;;
         --ssh-key) SSH_KEY="$2"; shift ;;
         --comfy-iterations) COMFY_ITERATIONS="$2"; shift ;;
         --context-lengths) CONTEXT_LENGTHS="$2"; shift ;;
@@ -425,7 +426,7 @@ run_genai_perf_client() {
         --output-tokens '$OUTPUT_TOKENS' \
         --num-prompts '$NUM_PROMPTS' \
         --results-dir '$remote_res' \
-        --measurement-interval '$MEASUREMENT_INTERVAL' \
+        --measurement-interval '${EFF_INTERVAL:-$MEASUREMENT_INTERVAL}' \
         $rt_arg $ctx_arg" || exit_code=$?
 
     # Pull results back to the master results dir
@@ -841,40 +842,16 @@ get_vllm_model_info() {
 }
 
 define_run_all_matrix() {
-    # ── Team LLM (vLLM) — GPTQ models (vendor-neutral: NVIDIA/Intel/AMD) ───
-
-    # Choice 1: Qwen 3.6 35B MoE FP16 (unquantized, ~70 GB)
-    if [ "$TOTAL_VRAM" -ge 70 ]; then
-        TEST_MATRIX+=("team_llm|1|Qwen3.6-35B-A3B-FP16|70||$CONCURRENCY")
-    fi
-
-    # Choice 2: Qwen 3.6 27B Dense GPTQ (18 GB)
-    if [ "$TOTAL_VRAM" -ge 18 ]; then
-        TEST_MATRIX+=("team_llm|2|Qwen3.6-27B-Dense-GPTQ|18||$CONCURRENCY")
-    fi
-
-    # Choice 3: Qwen 3.5 35B MoE GPTQ (22 GB)
-    if [ "$TOTAL_VRAM" -ge 22 ]; then
-        TEST_MATRIX+=("team_llm|3|Qwen3.5-35B-A3B-GPTQ|22||$CONCURRENCY")
-    fi
-
-    # Choice 4: Qwen 3.5 122B MoE GPTQ (80 GB)
-    if [ "$TOTAL_VRAM" -ge 80 ]; then
-        TEST_MATRIX+=("team_llm|4|Qwen3.5-122B-A10B-GPTQ|80||$CONCURRENCY")
-    fi
-
-    # Choice 5: DeepSeek R1 70B GPTQ (40 GB)
-    if [ "$TOTAL_VRAM" -ge 40 ]; then
-        TEST_MATRIX+=("team_llm|5|DeepSeek-R1-70B-GPTQ|40||$CONCURRENCY")
-    fi
-
-    # Choice 6: Gemma 4 26B MoE GPTQ (20 GB)
-    if [ "$TOTAL_VRAM" -ge 20 ]; then
-        TEST_MATRIX+=("team_llm|6|Gemma4-26B-A4B-GPTQ|20||$CONCURRENCY")
-    fi
-
-    # Choice 7: Llama 4 8B FP16 (16 GB)
-    TEST_MATRIX+=("team_llm|7|Llama4-8B-FP16|16||$CONCURRENCY")
+    # ── Team LLM (vLLM) — enumerate the LIVE app-pack menu (single source of
+    #    truth). select_vllm_model VRAM-gates each choice; get_vllm_model_info
+    #    returns non-zero for insufficient-VRAM / Custom / Skip / out-of-range, so
+    #    we keep exactly the models the menu would actually offer on this hardware.
+    local _c
+    for _c in $(seq 1 12); do
+        if get_vllm_model_info "$_c" >/dev/null 2>&1; then
+            TEST_MATRIX+=("team_llm|${_c}|menu_choice_${_c}|0||$CONCURRENCY")
+        fi
+    done
 
     # ── Personal LLM (Ollama) — mirrors app-pack ollama_model_select.sh ─────
     TEST_MATRIX+=("personal_llm|1|qwen3:8b|5|qwen3:8b|1")
@@ -1098,16 +1075,16 @@ else
             echo ""
             show_vllm_menu_remote
             echo ""
-            read -p "  Select [1-11]: " MODEL_CHOICE
-            if [[ "$MODEL_CHOICE" =~ ^(10|11)$ ]]; then
-                if [ "$MODEL_CHOICE" = "10" ]; then
-                    read -p "  Enter HuggingFace model ID: " CUSTOM_MODEL
-                    TEST_MATRIX+=("team_llm|custom|${CUSTOM_MODEL}|0||${CONCURRENCY}")
-                else
-                    echo "Exiting."; exit 0
-                fi
+            # Don't hardcode menu numbering — it differs per vendor/branch. Accept
+            # any number and let the app-pack menu validate it; anything that
+            # doesn't resolve (Custom, Skip, invalid) falls through to custom entry.
+            read -p "  Select a model number (or 'c' for a custom HF ID): " MODEL_CHOICE
+            if [[ "$MODEL_CHOICE" =~ ^[0-9]+$ ]] && get_vllm_model_info "$MODEL_CHOICE" >/dev/null 2>&1; then
+                TEST_MATRIX+=("team_llm|${MODEL_CHOICE}|menu_choice_${MODEL_CHOICE}|0||${CONCURRENCY}")
             else
-                TEST_MATRIX+=("team_llm|${MODEL_CHOICE}|Menu_Choice_${MODEL_CHOICE}|0||${CONCURRENCY}")
+                read -p "  Enter HuggingFace model ID (owner/model): " CUSTOM_MODEL
+                if [ -z "$CUSTOM_MODEL" ]; then echo "  No model selected. Exiting."; exit 0; fi
+                TEST_MATRIX+=("team_llm|custom|${CUSTOM_MODEL}|0||${CONCURRENCY}")
             fi
             ;;
         2)
@@ -1212,6 +1189,7 @@ for entry in "${TEST_MATRIX[@]}"; do
     IFS='|' read -r BENCH_PACK BENCH_CHOICE BENCH_MODEL BENCH_MIN_VRAM BENCH_OLLAMA_TAG BENCH_CONCURRENCY <<< "$entry"
     BENCH_COUNT=$((BENCH_COUNT + 1))
     BENCH_OK=true   # set false on any non-fatal failure that still reaches loop end
+    EFF_INTERVAL=""  # per-model measurement window override (thinking models)
 
     _BENCH_START=$(date +%s)
 
@@ -1309,7 +1287,7 @@ GPU_COUNT=${m_gpus}
 GPU_MEMORY_UTILIZATION=${m_mem}
 DTYPE=${DTYPE_OVERRIDE:-${m_dtype}}
 MAX_CONTEXT=${MAX_MODEL_LEN:-${m_ctx}}
-REASONING_ARGS=${m_reason}
+REASONING_ARGS=
 EXTRA_VLLM_ARGS=${m_extra}
 TOOL_CALL_ARGS=${m_tool}
 THINKING_ARGS=${m_thinking}
@@ -1320,6 +1298,18 @@ HF_ENDPOINT=${hf_endpoint_val}
 HF_TOKEN=${HF_TOKEN}
 HUGGINGFACE_TOKEN=${HF_TOKEN}
 ENVEOF
+        fi
+
+        # Reasoning/thinking models emit a long internal phase before visible output;
+        # at conc=1 a 30s window can capture 0 completed requests. If the user didn't
+        # set --measurement-interval, widen it to 120s for these. (The --reasoning-parser
+        # is intentionally NOT written to the bench .env — it splits reasoning out of the
+        # response so genai-perf under-counts decode throughput; we measure raw tokens.)
+        if [ "$MEASUREMENT_INTERVAL_SET" = false ]; then
+            if [ -n "${m_thinking:-}" ] || [ -n "${m_reason:-}" ] || echo "$BENCH_MODEL" | grep -qiE 'qwen3|deepseek-r1|qwq|reason|think'; then
+                EFF_INTERVAL=120000
+                echo -e "  ${BLUE}ℹ Reasoning model detected → using a 120s measurement window${NC}"
+            fi
         fi
 
         echo -e "  ${BLUE}Starting vLLM on target machine...${NC}"
