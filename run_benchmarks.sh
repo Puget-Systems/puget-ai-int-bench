@@ -2,15 +2,16 @@
 
 # Puget Systems AI App Pack — Automated Benchmark Suite
 #
-# End-to-end benchmark orchestrator that targets a remote inference server
-# to download, install, launch, benchmark, and tear down App Packs automatically.
-# Benchmarking client (genai-perf) runs locally.
+# End-to-end benchmark orchestrator: detects hardware, downloads/launches an
+# App Pack, benchmarks it (genai-perf, co-located on the GPU box for accurate
+# TTFT), and tears it down. Runs ON the box by default (no SSH); --host targets
+# a separate machine over SSH.
 #
 # Usage:
-#   ./run_benchmarks.sh --host USER@IP                     # Interactive mode targeting a remote server
-#   ./run_benchmarks.sh --host USER@IP --cache-proxy URL   # With cache proxy
-#   ./run_benchmarks.sh --host USER@IP --pack team_llm --model 1
-#   ./run_benchmarks.sh --host USER@IP --run-all
+#   ./run_benchmarks.sh                                    # On-box, interactive (run at the hardware)
+#   ./run_benchmarks.sh --run-all                          # On-box, full VRAM-gated matrix
+#   ./run_benchmarks.sh --host USER@IP                     # Remote mode over SSH
+#   ./run_benchmarks.sh --pack team_llm --model 2          # On-box, non-interactive
 
 set -euo pipefail
 
@@ -107,11 +108,12 @@ while [[ "$#" -gt 0 ]]; do
             echo -e "${BLUE}Puget Systems AI App Pack — Automated Benchmark Suite${NC}"
             echo ""
             echo "Usage:"
-            echo "  ./run_benchmarks.sh --host USER@IP                   Interactive mode on remote server"
-            echo "  ./run_benchmarks.sh --host USER@IP --run-all         Run full test matrix on remote server"
+            echo "  ./run_benchmarks.sh                                  On-box mode — run on THIS machine (interactive)"
+            echo "  ./run_benchmarks.sh --run-all                        On-box mode — full VRAM-gated matrix"
+            echo "  ./run_benchmarks.sh --host USER@IP                   Remote mode — orchestrate a separate box over SSH"
             echo ""
             echo "Options:"
-            echo "  --host USER@IP       (Required) SSH target for server-side operations"
+            echo "  --host USER@IP       Remote SSH target. Omit (or use --host local) to run on this machine."
             echo "  --cache-proxy URL    Squid cache proxy for model downloads"
             echo "  --pack NAME          App Pack: team_llm, personal_llm, comfy_ui"
             echo "  --model CHOICE       Model menu number (1-9) or model ID string"
@@ -131,14 +133,20 @@ while [[ "$#" -gt 0 ]]; do
     shift
 done
 
-if [ -z "$HOST" ]; then
-    echo -e "${RED}✗ Error: --host USER@IP is required.${NC}"
-    echo "  The orchestrator runs on your local machine and uses SSH to manage App Packs on the inference server."
-    exit 1
-fi
+# On-box (local) mode runs everything on THIS machine with no SSH — the intended
+# path for an integration specialist sitting at the hardware under test. Remote
+# mode (--host USER@IP) still works for orchestrating a separate box.
+LOCAL_MODE=false
+case "$HOST" in
+    ""|local|localhost|127.0.0.1) LOCAL_MODE=true ;;
+esac
 
-# Extract IP/hostname from USER@IP format
-REMOTE_IP="${HOST#*@}"
+# Extract IP/hostname from USER@IP format (localhost in on-box mode)
+if [ "$LOCAL_MODE" = true ]; then
+    REMOTE_IP="localhost"
+else
+    REMOTE_IP="${HOST#*@}"
+fi
 BENCH_URL_BASE="http://${REMOTE_IP}"
 
 # ============================================
@@ -149,8 +157,34 @@ if [ -n "$SSH_KEY" ]; then
     SSH_OPTS+=(-i "$SSH_KEY")
 fi
 
+# target_cmd runs a command on the target machine. In on-box (local) mode this
+# is a local shell; in remote mode it is an SSH call. Callers pass a single
+# command string and may pipe a heredoc on stdin — both forms preserve stdin.
 target_cmd() {
-    ssh "${SSH_OPTS[@]}" "$HOST" "$@"
+    if [ "$LOCAL_MODE" = true ]; then
+        bash -c "$*"
+    else
+        ssh "${SSH_OPTS[@]}" "$HOST" "$@"
+    fi
+}
+
+# push_file SRC DEST — copy a local file to the target.
+push_file() {
+    if [ "$LOCAL_MODE" = true ]; then
+        cp "$1" "$2"
+    else
+        scp "${SSH_OPTS[@]}" "$1" "$HOST:$2" >/dev/null 2>&1
+    fi
+}
+
+# pull_dir SRC_DIR DEST_DIR — copy a results directory from the target back.
+pull_dir() {
+    mkdir -p "$2"
+    if [ "$LOCAL_MODE" = true ]; then
+        cp -a "$1/." "$2/" 2>/dev/null || true
+    else
+        rsync -a -e "ssh ${SSH_OPTS[*]}" "$HOST:$1/" "$2/" 2>/dev/null || true
+    fi
 }
 
 # ============================================
@@ -303,15 +337,15 @@ run_genai_perf_client() {
     local remote_res="$REMOTE_TEMP_DIR/genai_${safe_tag}"
     target_cmd "rm -rf '$remote_res'; mkdir -p '$remote_res'"
 
-    # Ship the genai-perf runner to the remote (single source of truth)
-    scp "${SSH_OPTS[@]}" "$SCRIPT_DIR/llm_tests/run_genai_perf.sh" "$HOST:$REMOTE_TEMP_DIR/run_genai_perf.sh" >/dev/null 2>&1
+    # Ship the genai-perf runner to the target (single source of truth)
+    push_file "$SCRIPT_DIR/llm_tests/run_genai_perf.sh" "$REMOTE_TEMP_DIR/run_genai_perf.sh"
 
     local ctx_arg=""
     if [ -n "${CONTEXT_LENGTHS:-}" ]; then
         ctx_arg="--context-lengths ${CONTEXT_LENGTHS}"
     fi
 
-    echo -e "  ${BLUE}Running genai-perf on remote host (native net) → localhost:${port}...${NC}"
+    echo -e "  ${BLUE}Running genai-perf on the target (native net) → localhost:${port}...${NC}"
 
     local rt_arg=""
     if [ -n "${REQUEST_TIMEOUT:-}" ]; then
@@ -333,8 +367,8 @@ run_genai_perf_client() {
         --measurement-interval '$MEASUREMENT_INTERVAL' \
         $rt_arg $ctx_arg" || exit_code=$?
 
-    # Pull results back to the local master results dir
-    rsync -a -e "ssh ${SSH_OPTS[*]}" "$HOST:$remote_res/" "$results_dir/" 2>/dev/null || true
+    # Pull results back to the master results dir
+    pull_dir "$remote_res" "$results_dir"
 
     return $exit_code
 }
@@ -344,14 +378,19 @@ echo -e "${BLUE}   Puget Systems AI App Pack — Automated Benchmark Suite${NC}"
 echo -e "${BLUE}==============================================================${NC}"
 echo ""
 
-# Test SSH connection
-echo -e "${YELLOW}[0/6] Testing SSH connection to $HOST...${NC}"
-if ! target_cmd "echo 'SSH connection successful'" >/dev/null; then
-    echo -e "${RED}✗ SSH connection failed. Make sure you have key-based auth set up:${NC}"
-    echo "   ssh-copy-id $HOST"
-    exit 1
+# Connect to the target (skip SSH entirely in on-box mode)
+if [ "$LOCAL_MODE" = true ]; then
+    echo -e "${YELLOW}[0/6] On-box mode — running locally on this machine (no SSH).${NC}"
+    echo -e "${GREEN}✓ Target: $(hostname).${NC}"
+else
+    echo -e "${YELLOW}[0/6] Testing SSH connection to $HOST...${NC}"
+    if ! target_cmd "echo 'SSH connection successful'" >/dev/null; then
+        echo -e "${RED}✗ SSH connection failed. Make sure you have key-based auth set up:${NC}"
+        echo "   ssh-copy-id $HOST"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ Connected to $HOST.${NC}"
 fi
-echo -e "${GREEN}✓ Connected to $HOST.${NC}"
 
 if [ "$DRY_RUN" = true ]; then
     echo ""
@@ -362,10 +401,10 @@ fi
 # ============================================
 # 0.25. Local Preflight — Docker (needed for genai-perf)
 # ============================================
-# genai-perf runs inside a local Triton SDK container, so Docker must be
-# available on the machine executing this script.  ComfyUI benchmarks use
-# Python/curl and do NOT require local Docker.
-if ! command -v docker &>/dev/null; then
+# genai-perf now runs on the TARGET (the GPU box) via target_cmd, so in on-box
+# mode the box's Docker is verified by the preflight below — skip this client-side
+# check. It only matters in remote mode where the orchestrator is a separate box.
+if [ "$LOCAL_MODE" = false ] && ! command -v docker &>/dev/null; then
     echo ""
     echo -e "${YELLOW}[0.25/6] Local Docker check...${NC}"
     echo -e "${RED}✗ Docker is not installed on this machine.${NC}"
@@ -460,19 +499,27 @@ fi
 NEED_PREFLIGHT=false
 if ! target_cmd "command -v docker > /dev/null 2>&1"; then
     echo ""
-    echo -e "${YELLOW}[0.5/6] Docker not found on remote server — running preflight provisioning...${NC}"
+    echo -e "${YELLOW}[0.5/6] Docker not found on target machine — running preflight provisioning...${NC}"
     echo -e "${YELLOW}  This will install Docker CE and GPU drivers.${NC}"
     NEED_PREFLIGHT=true
 elif ! target_cmd "command -v nvidia-smi > /dev/null 2>&1" && ! target_cmd "ls /dev/dri/renderD* > /dev/null 2>&1"; then
     echo ""
-    echo -e "${YELLOW}[0.5/6] No GPU drivers found on remote server — running preflight...${NC}"
+    echo -e "${YELLOW}[0.5/6] No GPU drivers found on target machine — running preflight...${NC}"
     NEED_PREFLIGHT=true
 else
-    echo -e "${GREEN}✓ Docker and GPU drivers detected on remote server.${NC}"
+    echo -e "${GREEN}✓ Docker and GPU drivers detected on target machine.${NC}"
 fi
 
 if [ "$NEED_PREFLIGHT" = true ]; then
     echo ""
+
+    if [ "$LOCAL_MODE" = true ]; then
+        echo -e "${RED}✗ Docker and/or GPU drivers are missing on this machine.${NC}"
+        echo "  In on-box mode, install them first — the App Pack installer handles this:"
+        echo "    curl -fsSL https://raw.githubusercontent.com/Puget-Systems/puget-docker-app-pack/main/setup.sh -o setup.sh && bash setup.sh"
+        echo "  (Or pass --host USER@IP to provision a remote box over SSH.)"
+        exit 1
+    fi
 
     PREFLIGHT_SCRIPT="$SCRIPT_DIR/scripts/remote_preflight.sh"
     if [ ! -f "$PREFLIGHT_SCRIPT" ]; then
@@ -485,7 +532,7 @@ if [ "$NEED_PREFLIGHT" = true ]; then
         REMOTE_SUDO_PASS="$SUDO_PASS"
         echo -e "  ${GREEN}Using sudo password from config.${NC}"
     else
-        read -s -p "  Enter sudo password for remote server ($HOST): " REMOTE_SUDO_PASS
+        read -s -p "  Enter sudo password for target machine ($HOST): " REMOTE_SUDO_PASS
         echo ""
     fi
 
@@ -500,7 +547,7 @@ PREFLIGHT_STDIN
     # Helper to reboot and wait for server to come back
     reboot_and_wait() {
         echo ""
-        echo -e "${YELLOW}NVIDIA drivers were installed. Rebooting remote server...${NC}"
+        echo -e "${YELLOW}NVIDIA drivers were installed. Rebooting target machine...${NC}"
         ssh "${SSH_OPTS[@]}" "$HOST" "sudo -S reboot" <<< "$REMOTE_SUDO_PASS" 2>/dev/null || true
 
         echo -e "${YELLOW}  Waiting for server to go down...${NC}"
@@ -559,7 +606,7 @@ fi
 # 1. Acquire App Pack Repository (Remote)
 # ============================================
 echo ""
-echo -e "${YELLOW}[1/6] Acquiring App Pack repository on remote server...${NC}"
+echo -e "${YELLOW}[1/6] Acquiring App Pack repository on target machine...${NC}"
 
 REMOTE_TEMP_DIR=$(target_cmd "mktemp -d")
 cleanup() {
@@ -573,18 +620,25 @@ if [[ "$APP_PACK_REPO" == http* || "$APP_PACK_REPO" == git@* ]]; then
     echo -e "  Cloning ${BLUE}${APP_PACK_REPO}${NC} (branch: ${GREEN}${APP_PACK_BRANCH}${NC})..."
     # Ensure git is installed remotely
     if ! target_cmd "command -v git >/dev/null"; then
-        echo -e "${RED}✗ git is not installed on the remote server.${NC}"
+        echo -e "${RED}✗ git is not installed on the target machine.${NC}"
         exit 1
     fi
     if ! target_cmd "git clone --depth 1 --branch \"$APP_PACK_BRANCH\" \"$APP_PACK_REPO\" \"$REMOTE_TEMP_DIR/app-pack\" 2>&1 | tail -1"; then
-        echo -e "${RED}✗ Failed to clone App Pack repository on remote server.${NC}"
+        echo -e "${RED}✗ Failed to clone App Pack repository on target machine.${NC}"
         exit 1
     fi
 elif [ -d "$APP_PACK_REPO" ]; then
-    echo -e "  Syncing local repository ${BLUE}${APP_PACK_REPO}${NC} to remote server..."
-    if ! rsync -a -e "ssh ${SSH_OPTS[*]}" --exclude=".git" "$APP_PACK_REPO/" "$HOST:$REMOTE_TEMP_DIR/app-pack/"; then
-        echo -e "${RED}✗ Failed to rsync local repository to remote server.${NC}"
-        exit 1
+    echo -e "  Deploying local repository ${BLUE}${APP_PACK_REPO}${NC}..."
+    if [ "$LOCAL_MODE" = true ]; then
+        if ! rsync -a --exclude=".git" "$APP_PACK_REPO/" "$REMOTE_TEMP_DIR/app-pack/"; then
+            echo -e "${RED}✗ Failed to copy local repository.${NC}"
+            exit 1
+        fi
+    else
+        if ! rsync -a -e "ssh ${SSH_OPTS[*]}" --exclude=".git" "$APP_PACK_REPO/" "$HOST:$REMOTE_TEMP_DIR/app-pack/"; then
+            echo -e "${RED}✗ Failed to rsync local repository to target machine.${NC}"
+            exit 1
+        fi
     fi
 else
     echo -e "${RED}✗ APP_PACK_REPO is not a valid URL or local directory: ${APP_PACK_REPO}${NC}"
@@ -602,7 +656,7 @@ target_cmd "sed -i '/RUN pip install --no-cache-dir/i RUN apt-get update && apt-
 # 2. Integrity Check (MD5) - Remote
 # ============================================
 echo ""
-echo -e "${YELLOW}[2/6] Verifying installer integrity on remote server...${NC}"
+echo -e "${YELLOW}[2/6] Verifying installer integrity on target machine...${NC}"
 
 CHECKSUM_FILE="$PACK_ROOT/install.sh.md5"
 if [ "$SKIP_CHECKSUM" = true ]; then
@@ -615,7 +669,7 @@ elif target_cmd "[ -f \"$CHECKSUM_FILE\" ]"; then
     elif target_cmd "command -v md5 >/dev/null"; then
         ACTUAL_HASH=$(target_cmd "md5 -q \"$PACK_ROOT/install.sh\"")
     else
-        echo -e "${YELLOW}⚠ No md5 tool found on remote server — skipping integrity check.${NC}"
+        echo -e "${YELLOW}⚠ No md5 tool found on target machine — skipping integrity check.${NC}"
         ACTUAL_HASH="$EXPECTED_HASH"
     fi
 
@@ -634,13 +688,13 @@ fi
 # 3. Detect Hardware (Remote via helper script)
 # ============================================
 echo ""
-echo -e "${YELLOW}[3/6] Detecting hardware on remote server...${NC}"
+echo -e "${YELLOW}[3/6] Detecting hardware on target machine...${NC}"
 
 # We execute a small inline script remotely that sources gpu_detect.sh and prints key variables back to us
 GPU_INFO=$(target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\" && if detect_gpus; then echo \"OK|\$GPU_VENDOR|\$GPU_COUNT|\$TOTAL_VRAM|\$GPU_NAME|\$IS_BLACKWELL|\$COMPUTE_CAP|\$VRAM_GB\"; else echo \"FAIL\"; fi'")
 
 if [[ "$GPU_INFO" == "FAIL" || -z "$GPU_INFO" ]]; then
-    echo -e "${RED}✗ No GPUs detected on remote server. GPU benchmarks require NVIDIA, Intel, or AMD GPU drivers.${NC}"
+    echo -e "${RED}✗ No GPUs detected on target machine. GPU benchmarks require NVIDIA, Intel, or AMD GPU drivers.${NC}"
     exit 1
 fi
 
@@ -1202,7 +1256,7 @@ HUGGINGFACE_TOKEN=${HF_TOKEN}
 ENVEOF
         fi
 
-        echo -e "  ${BLUE}Starting vLLM on remote server...${NC}"
+        echo -e "  ${BLUE}Starting vLLM on target machine...${NC}"
 
         # Inject HF_TOKEN and shared model cache via compose override.
         # The app-pack compose creates a per-project vllm_cache volume; we override
@@ -1282,7 +1336,7 @@ ENVEOF
                     continue
                 fi
             else
-                echo -e "  ${GREEN}✓ vllm/vllm-openai-rocm:v0.20.2 already cached on remote.${NC}"
+                echo -e "  ${GREEN}✓ vllm/vllm-openai-rocm:v0.20.2 already cached on the target.${NC}"
             fi
         elif [ "$GPU_VENDOR" = "intel" ]; then
             if ! target_cmd "docker image inspect intel/llm-scaler-vllm:0.14.0-b8.2.1 >/dev/null 2>&1"; then
@@ -1295,7 +1349,7 @@ ENVEOF
                     continue
                 fi
             else
-                echo -e "  ${GREEN}✓ intel/llm-scaler-vllm:0.14.0-b8.2.1 already cached on remote.${NC}"
+                echo -e "  ${GREEN}✓ intel/llm-scaler-vllm:0.14.0-b8.2.1 already cached on the target.${NC}"
             fi
         fi
 
@@ -1357,7 +1411,7 @@ HTTPS_PROXY=${CACHE_PROXY}
 HF_TOKEN=${HF_TOKEN}
 ENVEOF
 
-        echo -e "  ${BLUE}Starting Ollama on remote server...${NC}"
+        echo -e "  ${BLUE}Starting Ollama on target machine...${NC}"
         # Share a single Ollama data volume across all personal_llm benchmarks
         target_cmd "docker volume create shared_ollama_data 2>/dev/null || true"
         _OL_OVERRIDE="services:\n  inference:\n"
@@ -1494,11 +1548,11 @@ COMFYENV
         fi
 
         # Build container (smart_build skips if fingerprint unchanged)
-        echo -e "  ${BLUE}Building ComfyUI container on remote server (smart build)...${NC}"
+        echo -e "  ${BLUE}Building ComfyUI container on target machine (smart build)...${NC}"
         target_cmd "bash -c 'source \"$COMFY_WORK_DIR/scripts/lib/smart_build.sh\" && cd \"$COMFY_WORK_DIR\" && smart_build'"
 
         # Launch
-        echo -e "  ${BLUE}Starting ComfyUI on remote server...${NC}"
+        echo -e "  ${BLUE}Starting ComfyUI on target machine...${NC}"
         # Fix ownership on volume-mount dirs (container runs as UID 999, GID 1500)
         target_cmd "mkdir -p \"$COMFY_WORK_DIR/output\" \"$COMFY_WORK_DIR/input\" \"$COMFY_WORK_DIR/custom_nodes\""
         target_cmd "chmod -R 777 \"$COMFY_WORK_DIR/output\" \"$COMFY_WORK_DIR/input\" 2>/dev/null || true"
