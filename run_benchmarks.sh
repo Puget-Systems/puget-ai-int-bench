@@ -30,7 +30,7 @@ NC='\033[0m'
 # ============================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_PACK_REPO="https://github.com/Puget-Systems/puget-docker-app-packs.git"
-APP_PACK_BRANCH="amd-rocm"
+APP_PACK_BRANCH="main"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/puget-bench"
 CONFIG_FILE="$CONFIG_DIR/bench.conf"
 
@@ -725,8 +725,8 @@ echo -e "${GREEN}✓ Repository deployed to $REMOTE_TEMP_DIR/app-pack.${NC}"
 
 PACK_ROOT="$REMOTE_TEMP_DIR/app-pack"
 
-# Temporary fix for Gemma 4 Dockerfile missing git
-target_cmd "sed -i '/RUN pip install --no-cache-dir/i RUN apt-get update && apt-get install -y git' \"$PACK_ROOT/packs/team_llm/Dockerfile.gemma4\""
+# Temporary fix for Gemma 4 Dockerfile missing git (only present on some branches)
+target_cmd "[ -f \"$PACK_ROOT/packs/team_llm/Dockerfile.gemma4\" ] && sed -i '/RUN pip install --no-cache-dir/i RUN apt-get update && apt-get install -y git' \"$PACK_ROOT/packs/team_llm/Dockerfile.gemma4\" || true"
 
 # ============================================
 # 2. Integrity Check (MD5) - Remote
