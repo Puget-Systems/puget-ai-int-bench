@@ -36,6 +36,10 @@ APP_PACK_BRANCH="main"
 # skipped otherwise. Override per-run with --cache-proxy or CACHE_PROXY in bench.conf.
 # TODO: switch to a DNS hostname once IT assigns one.
 DEFAULT_CACHE_HOST="${PUGET_CACHE_HOST:-172.19.168.179}"
+# Hard cap on how long to wait for a model to load/serve before declaring it failed.
+# Without this, a hung server (e.g. an NCCL deadlock) makes the monitor wait forever.
+# Generous by default to tolerate large models / cold loads; override as needed.
+MODEL_LOAD_TIMEOUT="${MODEL_LOAD_TIMEOUT:-1800}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/puget-bench"
 CONFIG_FILE="$CONFIG_DIR/bench.conf"
 
@@ -48,6 +52,7 @@ PACK=""
 MODEL_CHOICE=""
 RUN_ALL=false
 DRY_RUN=false
+DOCTOR=false
 CONCURRENCY="1,4,8,16"
 SSH_KEY=""
 INPUT_TOKENS=500
@@ -92,6 +97,7 @@ while [[ "$#" -gt 0 ]]; do
         --model) MODEL_CHOICE="$2"; shift ;;
         --run-all) RUN_ALL=true ;;
         --dry-run) DRY_RUN=true ;;
+        --doctor) DOCTOR=true ;;
         --concurrency) CONCURRENCY="$2"; shift ;;
         --repo) APP_PACK_REPO="$2"; shift ;;
         --branch) APP_PACK_BRANCH="$2"; shift ;;
@@ -117,6 +123,7 @@ while [[ "$#" -gt 0 ]]; do
             echo "  ./run_benchmarks.sh                                  On-box mode — run on THIS machine (interactive)"
             echo "  ./run_benchmarks.sh --run-all                        On-box mode — full VRAM-gated matrix"
             echo "  ./run_benchmarks.sh --host USER@IP                   Remote mode — orchestrate a separate box over SSH"
+            echo "  ./run_benchmarks.sh --doctor                         Readiness check only — verify the box can run, then exit"
             echo ""
             echo "Options:"
             echo "  --host USER@IP       Remote SSH target. Omit (or use --host local) to run on this machine."
@@ -193,6 +200,98 @@ pull_dir() {
     else
         rsync -a -e "ssh ${SSH_OPTS[*]}" "$HOST:$1/" "$2/" 2>/dev/null || true
     fi
+}
+
+# run_doctor — read-only readiness check (invoked by --doctor; never runs a benchmark).
+# Verifies a box can run the suite: Docker, GPU + interconnect, disk, port 8000, the
+# lab cache, and HF token. Lets an integration specialist confirm readiness unaided.
+run_doctor() {
+    local fail=0 warn=0
+    echo -e "${BLUE}==============================================================${NC}"
+    echo -e "${BLUE}   Puget Systems AI Benchmark — Doctor (readiness check)${NC}"
+    echo -e "${BLUE}==============================================================${NC}"
+    if [ "$LOCAL_MODE" = true ]; then
+        echo -e "  Mode: ${GREEN}on-box${NC} (this machine)"
+    else
+        echo -e "  Mode: remote → ${HOST}"
+        if target_cmd "true" 2>/dev/null; then
+            echo -e "  ${GREEN}✓${NC} SSH reachable"
+        else
+            echo -e "  ${RED}✗${NC} SSH to ${HOST} failed"; return 1
+        fi
+    fi
+    echo ""
+
+    # Docker
+    if target_cmd "command -v docker >/dev/null 2>&1"; then
+        if target_cmd "docker info >/dev/null 2>&1"; then
+            echo -e "  ${GREEN}✓${NC} Docker: $(target_cmd "docker --version" 2>/dev/null)"
+        else
+            echo -e "  ${RED}✗${NC} Docker installed but daemon not running / no permission"; fail=$((fail+1))
+        fi
+    else
+        echo -e "  ${RED}✗${NC} Docker not installed"; fail=$((fail+1))
+    fi
+
+    # GPU + interconnect
+    if target_cmd "command -v nvidia-smi >/dev/null 2>&1"; then
+        local g n nvl
+        g=$(target_cmd "nvidia-smi --query-gpu=name,memory.total,driver_version,compute_cap --format=csv,noheader" 2>/dev/null)
+        n=$(echo "$g" | grep -c .)
+        echo -e "  ${GREEN}✓${NC} NVIDIA GPUs: ${n}"
+        echo "$g" | sed 's/^/        /'
+        if [ "${n:-0}" -gt 1 ]; then
+            nvl=$(target_cmd "nvidia-smi topo -m 2>/dev/null | grep -E '^[[:space:]]*GPU[0-9]' | grep -oE 'NV[0-9]+' | head -1" 2>/dev/null)
+            if [ -n "$nvl" ]; then
+                echo -e "        Interconnect: NVLink (NCCL P2P stays on)"
+            else
+                echo -e "        Interconnect: PCIe (NCCL P2P will be auto-disabled)"
+            fi
+        fi
+    elif target_cmd "command -v rocm-smi >/dev/null 2>&1"; then
+        echo -e "  ${GREEN}✓${NC} AMD ROCm GPU(s) detected"
+    elif target_cmd "command -v clinfo >/dev/null 2>&1 && clinfo 2>/dev/null | grep -qi intel"; then
+        echo -e "  ${GREEN}✓${NC} Intel GPU(s) detected"
+    else
+        echo -e "  ${RED}✗${NC} No supported GPU detected (nvidia-smi / rocm-smi / clinfo)"; fail=$((fail+1))
+    fi
+
+    # Disk
+    local disk
+    disk=$(target_cmd "df -h \"\$HOME\" 2>/dev/null | tail -1 | awk '{print \$4\" free of \"\$2}'" 2>/dev/null)
+    [ -n "$disk" ] && echo -e "  ${GREEN}✓${NC} Disk (\$HOME): ${disk}"
+
+    # Port 8000
+    if target_cmd "ss -ltn 2>/dev/null | grep -q ':8000 '"; then
+        echo -e "  ${YELLOW}⚠${NC} Port 8000 in use — a prior server may still be running"; warn=$((warn+1))
+    else
+        echo -e "  ${GREEN}✓${NC} Port 8000 free"
+    fi
+
+    # Lab cache
+    if target_cmd "curl -s --max-time 3 'http://${DEFAULT_CACHE_HOST}:8090/api/whoami' >/dev/null 2>&1"; then
+        echo -e "  ${GREEN}✓${NC} HF mirror reachable (${DEFAULT_CACHE_HOST}:8090) — model downloads cached"
+    else
+        echo -e "  ${YELLOW}⚠${NC} HF mirror unreachable (${DEFAULT_CACHE_HOST}:8090) — direct downloads"; warn=$((warn+1))
+    fi
+
+    # HF token (gated models)
+    if [ -n "${HF_TOKEN:-}" ]; then
+        echo -e "  ${GREEN}✓${NC} HF token set (gated models OK)"
+    else
+        echo -e "  ${YELLOW}⚠${NC} No HF token — gated models (some Llama/Gemma) will fail to download"; warn=$((warn+1))
+    fi
+
+    echo ""
+    if [ "$fail" -gt 0 ]; then
+        echo -e "  ${RED}✗ Not ready: ${fail} blocking issue(s), ${warn} warning(s).${NC}"
+        return 1
+    elif [ "$warn" -gt 0 ]; then
+        echo -e "  ${YELLOW}✓ Ready with ${warn} warning(s) — benchmarks can run.${NC}"
+        return 0
+    fi
+    echo -e "  ${GREEN}✓ All checks passed — ready to benchmark.${NC}"
+    return 0
 }
 
 # ensure_vllm_image IMG — guarantee the vLLM container image exists on the target.
@@ -455,6 +554,12 @@ run_genai_perf_client() {
 
     return $exit_code
 }
+
+# Readiness check only — verify the box can run, then exit (no benchmarks).
+if [ "$DOCTOR" = true ]; then
+    run_doctor
+    exit $?
+fi
 
 echo -e "${BLUE}==============================================================${NC}"
 echo -e "${BLUE}   Puget Systems AI App Pack — Automated Benchmark Suite${NC}"
@@ -1470,14 +1575,22 @@ ENVEOF
         target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null; docker compose up -d inference"
         echo ""
 
-        echo -e "  ${YELLOW}Waiting for model to load by invoking vllm_monitor remotely...${NC}"
-        target_cmd "bash -c 'source \"$WORK_DIR/scripts/lib/vllm_monitor.sh\" && wait_for_vllm \"puget_vllm\" \"0\"'"
+        echo -e "  ${YELLOW}Waiting for model to load by invoking vllm_monitor remotely (timeout ${MODEL_LOAD_TIMEOUT}s)...${NC}"
+        # Bound the wait: a hung server (NCCL deadlock, OOM stall) would otherwise make
+        # the monitor loop forever. On timeout, fall through to the API check below.
+        if ! target_cmd "timeout ${MODEL_LOAD_TIMEOUT} bash -c 'source \"$WORK_DIR/scripts/lib/vllm_monitor.sh\" && wait_for_vllm \"puget_vllm\" \"0\"'"; then
+            echo -e "  ${YELLOW}⚠ Model did not become ready within ${MODEL_LOAD_TIMEOUT}s (or monitor exited).${NC}"
+        fi
 
         if ! target_cmd "curl -s --max-time 5 http://localhost:8000/v1/models > /dev/null 2>&1"; then
             echo -e "  ${RED}✗ vLLM API not responding. Skipping.${NC}"
             target_cmd "cd \"$WORK_DIR\" && docker compose logs --tail 200"
-            # target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null"
             FAILED_BENCHMARKS+=("$BENCH_MODEL (vLLM failed)")
+            BENCH_OK=false
+            # Tear down the failed/hung container and free the GPUs before the next
+            # model — otherwise a stuck server holds VRAM into the following run.
+            target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null" || true
+            reap_workers_and_wait_gpu
             continue
         fi
 

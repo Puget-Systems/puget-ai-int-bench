@@ -25,9 +25,13 @@ collect_system_specs() {
     echo "Hostname: $target_hostname" >> "$spec_file"
     echo "" >> "$spec_file"
 
-    # Virtualization detection
+    # Virtualization detection. Note: systemd-detect-virt prints "none" to stdout
+    # AND exits non-zero on bare metal, so `|| echo unknown` would append a second
+    # line and break the match — use `|| true` and default an empty result instead.
     local virt_type
-    virt_type=$($run_cmd "systemd-detect-virt 2>/dev/null || echo 'unknown'")
+    virt_type=$($run_cmd "systemd-detect-virt 2>/dev/null || true")
+    virt_type=$(echo "$virt_type" | head -1 | tr -d '[:space:]')
+    [ -z "$virt_type" ] && virt_type="unknown"
     echo "Virtualization:" >> "$spec_file"
     if [ "$virt_type" = "none" ] || [ "$virt_type" = "unknown" ]; then
         echo "  Type: Bare Metal" >> "$spec_file"
