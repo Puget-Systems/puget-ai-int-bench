@@ -31,6 +31,11 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_PACK_REPO="https://github.com/Puget-Systems/puget-docker-app-packs.git"
 APP_PACK_BRANCH="main"
+# Lab cache host (DGX Spark): Olah HF mirror on :8090, Squid HTTP proxy on :3128
+# (puget-hypervisor-devops/terraform). Auto-probed and used when reachable, silently
+# skipped otherwise. Override per-run with --cache-proxy or CACHE_PROXY in bench.conf.
+# TODO: switch to a DNS hostname once IT assigns one.
+DEFAULT_CACHE_HOST="${PUGET_CACHE_HOST:-172.19.168.179}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/puget-bench"
 CONFIG_FILE="$CONFIG_DIR/bench.conf"
 
@@ -115,7 +120,9 @@ while [[ "$#" -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --host USER@IP       Remote SSH target. Omit (or use --host local) to run on this machine."
-            echo "  --cache-proxy URL    Squid cache proxy for model downloads"
+            echo "  --cache-proxy URL    Override the cache host (Squid :3128 + HF mirror :8090)."
+            echo "                       The lab cache is auto-detected when reachable; this is only"
+            echo "                       needed to point at a different host."
             echo "  --pack NAME          App Pack: team_llm, personal_llm, comfy_ui"
             echo "  --model CHOICE       Model menu number (1-9) or model ID string"
             echo "  --run-all            Run all VRAM-appropriate models automatically"
@@ -804,26 +811,42 @@ elif [ "$IS_BLACKWELL" = "true" ]; then
     echo -e "${GREEN}  Blackwell GPU detected (compute ${COMPUTE_CAP}) → using CUDA 13.0 paths${NC}"
 fi
 
+# Cache auto-discovery. Pick the cache host: explicit --cache-proxy wins, else the
+# baked lab default (DGX Spark). Then probe the Olah HF mirror (:8090) and the Squid
+# HTTP proxy (:3128) independently — each is used only if it actually answers, so the
+# bench transparently uses the lab cache on-network and falls back to direct downloads
+# anywhere else. The HF mirror is the big win (it caches multi-GB model weights).
 HF_MIRROR=""
 if [ -n "$CACHE_PROXY" ]; then
-    # First verify the proxy itself is reachable before trusting it
-    _PROXY_HOST=$(echo "$CACHE_PROXY" | sed 's|http://||;s|:.*||')
-    _PROXY_PORT=$(echo "$CACHE_PROXY" | sed 's|.*:||')
-    if target_cmd "nc -z -w 2 '${_PROXY_HOST}' '${_PROXY_PORT}' 2>/dev/null || curl -sf --max-time 3 --proxy '' http://${_PROXY_HOST}:${_PROXY_PORT} >/dev/null 2>&1"; then
+    _CACHE_HOST=$(echo "$CACHE_PROXY" | sed 's|http://||;s|:.*||')
+    _SQUID_URL="$CACHE_PROXY"
+    _CACHE_EXPLICIT=true
+else
+    _CACHE_HOST="$DEFAULT_CACHE_HOST"
+    _SQUID_URL="http://${DEFAULT_CACHE_HOST}:3128"
+    _CACHE_EXPLICIT=false
+fi
+CACHE_PROXY=""   # set below only if the proxy actually answers
+
+if [ -n "$_CACHE_HOST" ]; then
+    # Olah HF mirror (:8090) — caches HuggingFace model weight downloads.
+    if target_cmd "curl -s --max-time 3 'http://${_CACHE_HOST}:8090/api/whoami' > /dev/null 2>&1"; then
+        HF_MIRROR="http://${_CACHE_HOST}:8090"
+        echo -e "${GREEN}✓ HF Mirror: ${HF_MIRROR} (model downloads cached)${NC}"
+    fi
+    # Squid forward proxy — generic HTTP / Docker layer caching.
+    _SQ_HOST=$(echo "$_SQUID_URL" | sed 's|http://||;s|:.*||')
+    _SQ_PORT=$(echo "$_SQUID_URL" | sed 's|.*:||')
+    if target_cmd "nc -z -w 2 '${_SQ_HOST}' '${_SQ_PORT}' 2>/dev/null || curl -sf --max-time 3 --proxy '' '${_SQUID_URL}' > /dev/null 2>&1"; then
+        CACHE_PROXY="$_SQUID_URL"
         echo -e "${GREEN}✓ Cache Proxy: ${CACHE_PROXY}${NC}"
-        # Derive HF mirror URL from proxy host (port 8090 = puget_hf_mirror)
-        HF_MIRROR="http://${_PROXY_HOST}:8090"
-        # Verify the mirror is reachable
-        if target_cmd "curl -s --max-time 3 '${HF_MIRROR}/api/whoami' > /dev/null 2>&1"; then
-            echo -e "${GREEN}✓ HF Mirror: ${HF_MIRROR} (model downloads will be cached)${NC}"
+    fi
+    if [ -z "$HF_MIRROR" ] && [ -z "$CACHE_PROXY" ]; then
+        if [ "$_CACHE_EXPLICIT" = true ]; then
+            echo -e "${YELLOW}⚠ Cache host ${_CACHE_HOST} unreachable — direct downloads this run${NC}"
         else
-            HF_MIRROR=""
-            echo -e "${YELLOW}⚠ HF Mirror not reachable at ${_PROXY_HOST}:8090 — direct downloads${NC}"
+            echo -e "${BLUE}ℹ No lab cache reachable (${_CACHE_HOST}) — using direct downloads${NC}"
         fi
-    else
-        echo -e "${YELLOW}⚠ Cache Proxy ${CACHE_PROXY} is unreachable — disabling proxy for this run${NC}"
-        CACHE_PROXY=""
-        HF_MIRROR=""
     fi
 fi
 

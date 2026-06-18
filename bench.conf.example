@@ -3,9 +3,15 @@
 #
 # All values are optional — command-line flags override config file values.
 
-# Squid cache proxy on DGX Spark for faster model downloads
-# (Deployed via puget-hypervisor-devops/terraform — docker_cache_proxy module)
-CACHE_PROXY=http://CACHE_PROXY_IP:3128
+# Lab cache (DGX Spark): Olah HF mirror (:8090) caches model weights, Squid (:3128)
+# caches generic HTTP/Docker. Both are AUTO-DETECTED and used when reachable — you do
+# not need to set anything here on the lab network. Deployed via
+# puget-hypervisor-devops/terraform (olah_mirror + docker_cache_proxy modules).
+#
+# Only set CACHE_PROXY to point at a DIFFERENT cache host (the HF mirror is assumed at
+# :8090 on the same host). To just change the auto-default host, set the env var
+# PUGET_CACHE_HOST=<host> instead.
+# CACHE_PROXY=http://OTHER_CACHE_HOST:3128
 
 # Git branch of puget-docker-app-pack to clone (default: main)
 # APP_PACK_BRANCH=main
