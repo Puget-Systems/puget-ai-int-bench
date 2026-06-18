@@ -312,9 +312,23 @@ start_power_monitor() {
                 sleep $interval
             done
         ' > /dev/null 2>&1 & echo \$! > /tmp/puget_bench_power.pid" 2>/dev/null
+    elif [ "$GPU_VENDOR" = "nvidia" ]; then
+        # NVIDIA: sum power.draw (watts) across all GPUs via nvidia-smi.
+        target_cmd "nohup bash -c '
+            echo \"timestamp_s,total_gpu_watts\" > $POWER_MONITOR_LOG
+            while true; do
+                total=0
+                for p in \$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null); do
+                    total=\$(echo \"\$total + \$p\" | bc 2>/dev/null || echo \"\$total\")
+                done
+                echo \"\$(date +%s),\$total\" >> $POWER_MONITOR_LOG
+                sleep $interval
+            done
+        ' > /dev/null 2>&1 & echo \$! > /tmp/puget_bench_power.pid" 2>/dev/null
     else
-        echo -e "  ${YELLOW}⚠ Power monitoring not supported for GPU vendor: $GPU_VENDOR${NC}"
-        return 1
+        # Power monitoring is optional telemetry — never fatal to the benchmark.
+        echo -e "  ${YELLOW}⚠ Power monitoring not supported for GPU vendor: ${GPU_VENDOR:-unknown}${NC}"
+        return 0
     fi
 
     echo -e "  ${BLUE}⚡ GPU power monitor started (polling every ${interval}s)${NC}"
@@ -720,28 +734,40 @@ target_cmd "sed -i '/RUN pip install --no-cache-dir/i RUN apt-get update && apt-
 echo ""
 echo -e "${YELLOW}[2/6] Verifying installer integrity on target machine...${NC}"
 
-CHECKSUM_FILE="$PACK_ROOT/install.sh.md5"
+# Mirror setup.sh: prefer the multi-file checksums.md5 manifest, fall back to
+# the legacy single-file install.sh.md5. (Verifying only the legacy file would
+# fail whenever it drifts from install.sh even though setup.sh — and therefore
+# real installs — pass via the manifest.)
+CHECKSUM_MANIFEST="$PACK_ROOT/checksums.md5"
+LEGACY_CHECKSUM="$PACK_ROOT/install.sh.md5"
 if [ "$SKIP_CHECKSUM" = true ]; then
     echo -e "${YELLOW}⚠ Skipping integrity check (--skip-checksum).${NC}"
-elif target_cmd "[ -f \"$CHECKSUM_FILE\" ]"; then
-    EXPECTED_HASH=$(target_cmd "awk '{print \$1}' \"$CHECKSUM_FILE\"")
-    # Determine hashing tool
-    if target_cmd "command -v md5sum >/dev/null"; then
-        ACTUAL_HASH=$(target_cmd "md5sum \"$PACK_ROOT/install.sh\" | awk '{print \$1}'")
-    elif target_cmd "command -v md5 >/dev/null"; then
-        ACTUAL_HASH=$(target_cmd "md5 -q \"$PACK_ROOT/install.sh\"")
+elif ! target_cmd "command -v md5sum >/dev/null"; then
+    echo -e "${YELLOW}⚠ No md5sum on target machine — skipping integrity check.${NC}"
+elif target_cmd "[ -f \"$CHECKSUM_MANIFEST\" ]"; then
+    # Verify every shipped script against the manifest (md5sum -c resolves paths
+    # relative to the manifest's directory).
+    if target_cmd "cd \"$PACK_ROOT\" && md5sum -c --quiet checksums.md5 >/dev/null 2>&1"; then
+        N_FILES=$(target_cmd "grep -c . \"$CHECKSUM_MANIFEST\"")
+        echo -e "${GREEN}✓ All scripts verified (${N_FILES} files via checksums.md5).${NC}"
     else
-        echo -e "${YELLOW}⚠ No md5 tool found on target machine — skipping integrity check.${NC}"
-        ACTUAL_HASH="$EXPECTED_HASH"
+        echo -e "${RED}✗ Integrity check FAILED.${NC}"
+        target_cmd "cd \"$PACK_ROOT\" && md5sum -c checksums.md5 2>&1 | grep -v ': OK$'" || true
+        echo -e "  One or more shipped scripts may be corrupted or tampered with."
+        echo -e "  If you just edited scripts, run: ${BLUE}scripts/update_checksum.sh${NC}"
+        exit 1
     fi
-
+elif target_cmd "[ -f \"$LEGACY_CHECKSUM\" ]"; then
+    # Backwards compatibility: single-file install.sh.md5
+    EXPECTED_HASH=$(target_cmd "awk '{print \$1}' \"$LEGACY_CHECKSUM\"")
+    ACTUAL_HASH=$(target_cmd "md5sum \"$PACK_ROOT/install.sh\" | awk '{print \$1}'")
     if [ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]; then
         echo -e "${RED}✗ Integrity check FAILED.${NC}"
         echo -e "  Expected MD5: ${EXPECTED_HASH}"
         echo -e "  Got MD5:      ${ACTUAL_HASH}"
         exit 1
     fi
-    echo -e "${GREEN}✓ Installer integrity verified (MD5).${NC}"
+    echo -e "${GREEN}✓ Installer integrity verified (legacy install.sh.md5).${NC}"
 else
     echo -e "${YELLOW}⚠ No checksum file found — skipping integrity check.${NC}"
 fi
@@ -761,6 +787,13 @@ if [[ "$GPU_INFO" == "FAIL" || -z "$GPU_INFO" ]]; then
 fi
 
 IFS='|' read -r status GPU_VENDOR GPU_COUNT TOTAL_VRAM GPU_NAME IS_BLACKWELL COMPUTE_CAP VRAM_GB <<< "$GPU_INFO"
+
+# The NVIDIA (main) app-pack branch's gpu_detect.sh detects via nvidia-smi but
+# does not emit a vendor string. If detection succeeded with no vendor, it's
+# NVIDIA — default it so power monitoring and vendor-specific paths work.
+if [ -z "${GPU_VENDOR:-}" ] && [ "${GPU_COUNT:-0}" -gt 0 ]; then
+    GPU_VENDOR="nvidia"
+fi
 
 echo -e "${GREEN}✓ Found ${GPU_COUNT}x ${GPU_NAME} (${TOTAL_VRAM} GB total) [vendor: ${GPU_VENDOR}]${NC}"
 if [ "$GPU_VENDOR" = "amd" ]; then
@@ -1331,6 +1364,21 @@ ENVEOF
             _ENV+="      - VLLM_TARGET_DEVICE=rocm\n      - NCCL_P2P_DISABLE=1\n      - HIP_FORCE_DEV_KERNARG=1\n"
         else
             _OVERRIDE="services:\n  inference:\n"
+            # NVIDIA multi-GPU: choose the NCCL transport by interconnect.
+            # With NVLink, P2P is fast and reliable — keep it on. Without NVLink
+            # (PCIe-only, e.g. 2x RTX PRO 6000), P2P over PCIe can deadlock during
+            # distributed init, so disable it and let NCCL stage via shared mem/host.
+            # Detect NVLink via the topology matrix: NVLink-connected GPU pairs show
+            # an "NV<n>" token; PCIe-only pairs show SYS/NODE/PHB/PXB/PIX.
+            if [ "$GPU_VENDOR" = "nvidia" ] && [ "${GPU_COUNT:-1}" -gt 1 ]; then
+                nvlink_present=$(target_cmd "nvidia-smi topo -m 2>/dev/null | grep -E '^[[:space:]]*GPU[0-9]' | grep -oE 'NV[0-9]+' | head -1" 2>/dev/null || echo "")
+                if [ -n "$nvlink_present" ]; then
+                    echo -e "  ${GREEN}NVIDIA multi-GPU: NVLink detected → keeping NCCL P2P enabled${NC}"
+                else
+                    echo -e "  ${YELLOW}NVIDIA multi-GPU: no NVLink (PCIe) → setting NCCL_P2P_DISABLE=1 to avoid P2P hang${NC}"
+                    _ENV+="      - NCCL_P2P_DISABLE=1\n"
+                fi
+            fi
         fi
 
         if [ -n "$_ENV" ]; then
@@ -1416,7 +1464,7 @@ ENVEOF
         target_cmd "curl -s -X POST http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\": \"$API_MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"Pre-warmup: Puget Systems.\"}], \"max_tokens\": 50}' >/dev/null" || true
 
         echo ""
-        start_power_monitor 2
+        start_power_monitor 2 || true
         if ! run_genai_perf_client "vllm" "${BENCH_URL_BASE}:8000" "$API_MODEL" "$BENCH_CONCURRENCY" "$BENCH_RESULTS_DIR"; then
             echo -e "  ${RED}✗ genai-perf failed for ${BENCH_MODEL}${NC}"
             echo -e "  ${YELLOW}Capturing vLLM logs for debugging...${NC}"

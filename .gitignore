@@ -8,3 +8,5 @@ nohup.out
 *.log
 images/
 puget-docker-app-packs-check/
+.playwright-mcp/
+*.png
