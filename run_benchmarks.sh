@@ -36,10 +36,13 @@ APP_PACK_BRANCH="main"
 # skipped otherwise. Override per-run with --cache-proxy or CACHE_PROXY in bench.conf.
 # TODO: switch to a DNS hostname once IT assigns one.
 DEFAULT_CACHE_HOST="${PUGET_CACHE_HOST:-172.19.168.179}"
-# Hard cap on how long to wait for a model to load/serve before declaring it failed.
-# Without this, a hung server (e.g. an NCCL deadlock) makes the monitor wait forever.
-# Generous by default to tolerate large models / cold loads; override as needed.
-MODEL_LOAD_TIMEOUT="${MODEL_LOAD_TIMEOUT:-1800}"
+# Absolute backstop on the load wait. The real bound is stall-based (vllm_monitor
+# fails after VLLM_STALL_SECONDS of no progress), which correctly distinguishes a
+# slow-but-progressing cold load from a hang. This flat ceiling only catches the rare
+# case where the monitor itself wedges, so keep it generous (2h) — a legitimate cold
+# ~140 GB download + load can run well past the old 30-min value.
+MODEL_LOAD_TIMEOUT="${MODEL_LOAD_TIMEOUT:-7200}"
+VLLM_STALL_SECONDS="${VLLM_STALL_SECONDS:-600}"  # no-progress window passed to the monitor
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/puget-bench"
 CONFIG_FILE="$CONFIG_DIR/bench.conf"
 
@@ -1629,7 +1632,7 @@ ENVEOF
         echo -e "  ${YELLOW}Waiting for model to load by invoking vllm_monitor remotely (timeout ${MODEL_LOAD_TIMEOUT}s)...${NC}"
         # Bound the wait: a hung server (NCCL deadlock, OOM stall) would otherwise make
         # the monitor loop forever. On timeout, fall through to the API check below.
-        if ! target_cmd "timeout ${MODEL_LOAD_TIMEOUT} bash -c 'source \"$WORK_DIR/scripts/lib/vllm_monitor.sh\" && wait_for_vllm \"puget_vllm\" \"0\"'"; then
+        if ! target_cmd "timeout ${MODEL_LOAD_TIMEOUT} bash -c 'source \"$WORK_DIR/scripts/lib/vllm_monitor.sh\" && wait_for_vllm \"puget_vllm\" \"0\" \"${VLLM_STALL_SECONDS}\"'"; then
             echo -e "  ${YELLOW}⚠ Model did not become ready within ${MODEL_LOAD_TIMEOUT}s (or monitor exited).${NC}"
         fi
 
