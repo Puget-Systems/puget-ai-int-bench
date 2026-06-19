@@ -1601,12 +1601,23 @@ ENVEOF
             continue
         fi
 
-        # DeepSeek R1 70B: default 131K context needs 20 GB KV cache but only ~9 GB
-        # is available after weights. Cap to 60000 if not already set by the app-pack.
-        if echo "$BENCH_MODEL" | grep -qi "deepseek.*70b\|deepseek-r1-70b"; then
+        # Large models (~70B+) default to a very long context (often 131K) whose KV
+        # cache won't fit after the weights are loaded, so vLLM crash-loops at startup
+        # ("max seq len needs N GiB KV cache > available"). Cap MAX_CONTEXT (when the
+        # app-pack left it unset) to a value that still covers this run's actual needs
+        # — the benchmark workload (input+output, or the --context-lengths sweep) is
+        # far smaller than 131K. Generalizes the old DeepSeek-70B-specific cap.
+        if echo "$BENCH_MODEL" | grep -qiE '7[02]b|11[0-9]b|12[0-9]b|[0-9]{3}b'; then
             if ! target_cmd "grep -q '^MAX_CONTEXT=.' \"$WORK_DIR/.env\"" 2>/dev/null; then
-                echo -e "  ${YELLOW}Capping DeepSeek R1 70B MAX_CONTEXT to 55000 (KV cache limit)${NC}"
-                target_cmd "sed -i 's|^MAX_CONTEXT=$|MAX_CONTEXT=55000|' \"$WORK_DIR/.env\""
+                _need_ctx=$(( ${INPUT_TOKENS:-500} + ${OUTPUT_TOKENS:-500} ))
+                if [ -n "${CONTEXT_LENGTHS:-}" ]; then
+                    _max_cl=$(echo "$CONTEXT_LENGTHS" | tr ',' '\n' | sort -n | tail -1)
+                    [ "${_max_cl:-0}" -gt "$_need_ctx" ] && _need_ctx=$_max_cl
+                fi
+                _cap=$(( _need_ctx + 4096 ))
+                [ "$_cap" -lt 32768 ] && _cap=32768
+                echo -e "  ${YELLOW}Large model: capping MAX_CONTEXT to ${_cap} (KV-cache headroom after weights)${NC}"
+                target_cmd "sed -i 's|^MAX_CONTEXT=$|MAX_CONTEXT=${_cap}|' \"$WORK_DIR/.env\""
             fi
         fi
 
