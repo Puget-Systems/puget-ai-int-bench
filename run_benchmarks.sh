@@ -63,7 +63,8 @@ MEASUREMENT_INTERVAL_SET=false   # true once the user passes --measurement-inter
 COMFY_ITERATIONS=10
 CONTEXT_LENGTHS=""  # e.g. "4096,32768,131072" — empty = use INPUT_TOKENS only
 SKIP_CHECKSUM=false
-HF_TOKEN=""         # HuggingFace token — load from bench.conf or --hf-token flag
+HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-${HUGGINGFACE_HUB_TOKEN:-}}}"  # respect an inherited env token; else bench.conf / --hf-token / cache / prompt
+HF_TOKEN_SOURCE=""  # where the token came from (for reporting)
 SUDO_PASS=""        # Remote sudo password — load from bench.conf or --sudo-pass flag
 NO_LOCAL_DOCKER=false  # Set by local preflight if Docker is unavailable
 FRESH_CACHE=false      # If true, clear model caches before running (default: keep cache)
@@ -202,6 +203,45 @@ pull_dir() {
     fi
 }
 
+# resolve_hf_token MODE — populate HF_TOKEN. Order: existing flag/env/bench.conf value,
+# then the local huggingface-cli cache (~/.cache/huggingface/token etc.). In MODE=prompt
+# with a TTY, prompt for one and offer to persist it to bench.conf. Resolution happens on
+# the launching machine, so the token is forwarded to a remote box via the .env we write.
+# MODE=quiet never prompts (used by --doctor). Safe in batch/nohup: the prompt is gated on
+# an interactive stdin, so it no-ops there.
+resolve_hf_token() {
+    local mode="${1:-quiet}" f
+    if [ -n "${HF_TOKEN:-}" ]; then
+        [ -z "$HF_TOKEN_SOURCE" ] && HF_TOKEN_SOURCE="flag/env/config"
+        return 0
+    fi
+    for f in "${HF_TOKEN_PATH:-}" "${HF_HOME:+$HF_HOME/token}" "$HOME/.cache/huggingface/token" "$HOME/.huggingface/token"; do
+        if [ -n "$f" ] && [ -f "$f" ]; then
+            HF_TOKEN=$(tr -d '[:space:]' < "$f" 2>/dev/null)
+            if [ -n "$HF_TOKEN" ]; then HF_TOKEN_SOURCE="$f"; return 0; fi
+        fi
+    done
+    if [ "$mode" = "prompt" ] && [ -t 0 ]; then
+        echo -e "${YELLOW}No HuggingFace token found${NC} — gated models (some Llama/Gemma) need one for tokenizer/weight access."
+        read -r -s -p "  Paste an HF token (or press Enter to skip gated models): " HF_TOKEN
+        echo ""
+        if [ -n "$HF_TOKEN" ]; then
+            HF_TOKEN_SOURCE="prompt"
+            local _save
+            read -r -p "  Save it to ${CONFIG_FILE} for next time? [y/N] " _save
+            if [[ "$_save" =~ ^[Yy]$ ]]; then
+                mkdir -p "$CONFIG_DIR"
+                [ -f "$CONFIG_FILE" ] && grep -v '^HF_TOKEN=' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" 2>/dev/null && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+                echo "HF_TOKEN=${HF_TOKEN}" >> "$CONFIG_FILE"
+                chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+                echo -e "  ${GREEN}✓ Saved to ${CONFIG_FILE}${NC}"
+            fi
+        fi
+    fi
+    [ -z "${HF_TOKEN:-}" ] && HF_TOKEN_SOURCE="none"
+    return 0
+}
+
 # run_doctor — read-only readiness check (invoked by --doctor; never runs a benchmark).
 # Verifies a box can run the suite: Docker, GPU + interconnect, disk, port 8000, the
 # lab cache, and HF token. Lets an integration specialist confirm readiness unaided.
@@ -275,11 +315,12 @@ run_doctor() {
         echo -e "  ${YELLOW}⚠${NC} HF mirror unreachable (${DEFAULT_CACHE_HOST}:8090) — direct downloads"; warn=$((warn+1))
     fi
 
-    # HF token (gated models)
+    # HF token (gated models) — discover without prompting
+    resolve_hf_token quiet
     if [ -n "${HF_TOKEN:-}" ]; then
-        echo -e "  ${GREEN}✓${NC} HF token set (gated models OK)"
+        echo -e "  ${GREEN}✓${NC} HF token found (${HF_TOKEN_SOURCE}) — gated models OK"
     else
-        echo -e "  ${YELLOW}⚠${NC} No HF token — gated models (some Llama/Gemma) will fail to download"; warn=$((warn+1))
+        echo -e "  ${YELLOW}⚠${NC} No HF token (checked env, bench.conf, ~/.cache/huggingface) — gated models will fail; run without --doctor to be prompted, or set HF_TOKEN in ${CONFIG_FILE}"; warn=$((warn+1))
     fi
 
     echo ""
@@ -564,6 +605,16 @@ fi
 echo -e "${BLUE}==============================================================${NC}"
 echo -e "${BLUE}   Puget Systems AI App Pack — Automated Benchmark Suite${NC}"
 echo -e "${BLUE}==============================================================${NC}"
+echo ""
+
+# Resolve the HF token up front (flag/env/bench.conf → local HF cache → prompt) so
+# gated models work and the token is forwarded to the target via the .env we write.
+resolve_hf_token prompt
+if [ -n "${HF_TOKEN:-}" ]; then
+    echo -e "${GREEN}✓ HuggingFace token: using ${HF_TOKEN_SOURCE}${NC}"
+else
+    echo -e "${YELLOW}⚠ No HuggingFace token — gated models (some Llama/Gemma) will be skipped/fail.${NC}"
+fi
 echo ""
 
 # Connect to the target (skip SSH entirely in on-box mode)

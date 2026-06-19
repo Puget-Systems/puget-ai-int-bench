@@ -19,7 +19,11 @@
 # Default concurrency levels for vLLM benchmarks
 # CONCURRENCY=1,4,8,16
 
-# HuggingFace token — required for gated models (Gemma, Llama, etc.)
+# HuggingFace token — required for gated models (Gemma, Llama, etc.).
+# You usually do NOT need to set this here: the bench auto-discovers a token from
+# (in order) the HF_TOKEN env var, this file, then your local huggingface-cli cache
+# (~/.cache/huggingface/token, i.e. the result of `huggingface-cli login`). If none is
+# found it prompts and offers to save it here. Set it explicitly only to override that.
 # Get yours at https://huggingface.co/settings/tokens
 # HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
