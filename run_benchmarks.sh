@@ -1584,14 +1584,14 @@ ENVEOF
             fi
         fi
 
-        # Gemma4 AWQ: upstream vLLM lacks packed-expert weight support.
-        # The model crashes with KeyError: 'layers.0.moe.experts.0.down_proj_packed'.
-        # Skip gracefully until vLLM adds support.
-        if echo "$BENCH_MODEL" | grep -qi "gemma.4"; then
-            echo -e "  ${YELLOW}⚠ Gemma4 AWQ is currently unsupported by vLLM (packed-expert weights).${NC}"
-            echo -e "  ${YELLOW}  Skipping benchmark. See: https://github.com/vllm-project/vllm/issues/${NC}"
-            echo "SKIPPED: Gemma4 AWQ — upstream vLLM lacks packed-expert weight support" > "$BENCH_RESULTS_DIR/SKIPPED.txt"
-            FAILED_BENCHMARKS+=("${BENCH_MODEL} (unsupported — vLLM packed experts)")
+        # Gemma4 AWQ packed-expert weights: skip only on the Intel XPU backend (B70),
+        # where it is known-unsupported. On NVIDIA/AMD, attempt it — let it run (or
+        # fail honestly) rather than pre-skipping. Gemma must not be skipped off B70.
+        if [ "$GPU_VENDOR" = "intel" ] && echo "$BENCH_MODEL" | grep -qi "gemma.4"; then
+            echo -e "  ${YELLOW}⚠ Gemma4 AWQ is unsupported on the Intel XPU vLLM backend (packed-expert weights).${NC}"
+            echo -e "  ${YELLOW}  Skipping benchmark on this hardware.${NC}"
+            echo "SKIPPED: Gemma4 AWQ — Intel XPU vLLM lacks packed-expert weight support" > "$BENCH_RESULTS_DIR/SKIPPED.txt"
+            FAILED_BENCHMARKS+=("${BENCH_MODEL} (unsupported on Intel XPU — packed experts)")
             _BENCH_ELAPSED=$(( $(date +%s) - _BENCH_START ))
             BENCH_TIMINGS+=("${BENCH_PACK}|${BENCH_MODEL}|${_BENCH_ELAPSED}")
             echo -e "  ${GREEN}⏱  ${BENCH_PACK} → ${BENCH_MODEL}: $(format_duration $_BENCH_ELAPSED)${NC}"
