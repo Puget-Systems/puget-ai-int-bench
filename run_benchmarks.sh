@@ -1061,8 +1061,12 @@ define_run_all_matrix() {
     #    truth). select_vllm_model VRAM-gates each choice; get_vllm_model_info
     #    returns non-zero for insufficient-VRAM / Custom / Skip / out-of-range, so
     #    we keep exactly the models the menu would actually offer on this hardware.
-    local _c
-    for _c in $(seq 1 12); do
+    # Ask the live menu how many entries it has (MENU_MAX) so adding/removing models
+    # in the app-pack flows through automatically — don't hardcode the upper bound.
+    local _c _menu_max
+    _menu_max=$(target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\" >/dev/null 2>&1; detect_gpus >/dev/null 2>&1; source \"$PACK_ROOT/scripts/lib/vllm_model_select.sh\" >/dev/null 2>&1; show_vllm_model_menu >/dev/null 2>&1; echo \${MENU_MAX:-12}'" 2>/dev/null)
+    [[ "$_menu_max" =~ ^[0-9]+$ ]] || _menu_max=12
+    for _c in $(seq 1 "$_menu_max"); do
         if get_vllm_model_info "$_c" >/dev/null 2>&1; then
             TEST_MATRIX+=("team_llm|${_c}|menu_choice_${_c}|0||$CONCURRENCY")
         fi

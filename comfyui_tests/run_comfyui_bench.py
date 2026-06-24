@@ -70,6 +70,42 @@ def find_output_node(workflow: dict) -> str | None:
     return None
 
 
+def save_output_image(base_url: str, prompt_id: str, results_dir: str, iteration: int) -> str | None:
+    """
+    Fetch the image(s) a completed prompt produced and save them under
+    results_dir/images/. ComfyUI keeps generated images inside the container,
+    so we pull them over the API (/history -> /view) before the container is
+    torn down. Returns the saved path of the first image, or None.
+    """
+    try:
+        hist = requests.get(f"{base_url}/history/{prompt_id}", timeout=10)
+        if hist.status_code != 200:
+            return None
+        outputs = hist.json().get(prompt_id, {}).get("outputs", {})
+        img_dir = os.path.join(results_dir, "images")
+        saved = None
+        for node_out in outputs.values():
+            for idx, img in enumerate(node_out.get("images", [])):
+                params = {
+                    "filename": img["filename"],
+                    "subfolder": img.get("subfolder", ""),
+                    "type": img.get("type", "output"),
+                }
+                v = requests.get(f"{base_url}/view", params=params, timeout=30)
+                if v.status_code != 200:
+                    continue
+                os.makedirs(img_dir, exist_ok=True)
+                ext = os.path.splitext(img["filename"])[1] or ".png"
+                suffix = "" if idx == 0 else f"_{idx}"
+                dest = os.path.join(img_dir, f"iteration_{iteration:02d}{suffix}{ext}")
+                with open(dest, "wb") as f:
+                    f.write(v.content)
+                saved = saved or dest
+        return saved
+    except Exception:
+        return None
+
+
 def inject_seed(workflow: dict, seed_node_id: str, seed: int) -> dict:
     """Inject a new seed into the workflow for this iteration."""
     inputs = workflow[seed_node_id]["inputs"]
@@ -160,6 +196,7 @@ async def run_single_iteration(
             "execution_time_ms": None,
             "total_time_ms": None,
             "vram_used_gb": None,
+            "prompt_id": None,
         }
 
     queue_time_ms = int((time.monotonic() - queue_start) * 1000)
@@ -243,6 +280,7 @@ async def run_single_iteration(
         "execution_time_ms": execution_time_ms,
         "total_time_ms": total_time_ms,
         "vram_used_gb": vram["vram_used_gb"],
+        "prompt_id": prompt_id,
     }
 
 
@@ -320,6 +358,10 @@ async def run_benchmark(
         )
         results.append(result)
 
+        # Pull the generated image over the API before the container is torn down.
+        if result["status"] == "OK" and result.get("prompt_id"):
+            save_output_image(base_url, result["prompt_id"], results_dir, i)
+
         status_icon = "✓" if result["status"] == "OK" else "✗"
         exec_s = (
             f"{result['execution_time_ms'] / 1000:.1f}s"
@@ -339,6 +381,7 @@ async def run_benchmark(
     fieldnames = [
         "iteration", "seed", "status", "error",
         "queue_time_ms", "execution_time_ms", "total_time_ms", "vram_used_gb",
+        "prompt_id",
     ]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

@@ -59,10 +59,12 @@ if [ "$ENDPOINT" == "ollama" ]; then
         qwen3*)         TOKENIZER_NAME="Qwen/Qwen3-30B-A3B" ;;
         deepseek-r1*)   TOKENIZER_NAME="deepseek-ai/DeepSeek-R1-Distill-Llama-70B" ;;
         nemotron-3*)    TOKENIZER_NAME="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4" ;;
-        gemma4*)        TOKENIZER_NAME="google/gemma-3-27b-it" ;;
-        llama4*)        TOKENIZER_NAME="meta-llama/Llama-4-Scout-17B-16E-Instruct" ;;
-        llama3.2*)      TOKENIZER_NAME="meta-llama/Llama-3.2-1B" ;;
-        llama3*)        TOKENIZER_NAME="meta-llama/Llama-3.1-8B" ;;
+        gemma4*)        TOKENIZER_NAME="unsloth/gemma-3-27b-it" ;;
+        # Use ungated unsloth mirrors so the tokenizer downloads without a Meta gate
+        # grant (the gated meta-llama/* repos 403 for accounts not on Meta's allowlist).
+        llama4*)        TOKENIZER_NAME="unsloth/Llama-4-Scout-17B-16E-Instruct" ;;
+        llama3.2*)      TOKENIZER_NAME="unsloth/Llama-3.2-1B-Instruct" ;;
+        llama3*)        TOKENIZER_NAME="unsloth/Meta-Llama-3.1-8B-Instruct" ;;
         *)              TOKENIZER_NAME="HuggingFaceTB/SmolLM-135M" ;;  # Safe fallback
     esac
     echo "Configuring for Personal LLM (Ollama) at $URL"
@@ -78,6 +80,29 @@ elif [ "$ENDPOINT" == "vllm" ]; then
 else
     echo "Error: Invalid endpoint. Use 'ollama' or 'vllm'."
     exit 1
+fi
+
+# ── Measurement-window profile (single source of truth) ───────────────────────
+# Reasoning/thinking models emit a long internal phase before any visible token, so
+# a short measurement window can capture zero completed requests and genai-perf aborts
+# with "Failed to obtain stable measurement". This table is the ONE place that decides
+# which models need the long (120s) window; it floors the interval for BOTH the vLLM and
+# Ollama paths (matched against the HF id or the Ollama tag, case-insensitively), so
+# neither path can regress. The per-concurrency auto-retry below is the safety net for
+# anything this list misses (e.g. a slow dense model on bandwidth-limited hardware).
+REASONING_LONG_INTERVAL=120000
+REASONING_MODEL_GLOBS='qwen3 qwq deepseek-r1 nemotron gpt-oss magistral reason think cogito'
+is_reasoning_model() {
+    local name g
+    name="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    for g in $REASONING_MODEL_GLOBS; do
+        case "$name" in *"$g"*) return 0 ;; esac
+    done
+    return 1
+}
+if is_reasoning_model "$MODEL_NAME" && [ "${MEASUREMENT_INTERVAL:-0}" -lt "$REASONING_LONG_INTERVAL" ]; then
+    echo "  ⏱  Reasoning model detected ($MODEL_NAME) → measurement window ${MEASUREMENT_INTERVAL}ms ⭢ ${REASONING_LONG_INTERVAL}ms"
+    MEASUREMENT_INTERVAL=$REASONING_LONG_INTERVAL
 fi
 
 # Set up results directory
@@ -117,6 +142,40 @@ else
     CTX_LIST=("$INPUT_TOKENS")
 fi
 
+# ── One genai-perf pass (returns the genai-perf exit code; never aborts the script) ──
+# Output is tee'd to GENAI_LOG so the caller can distinguish an unstable-measurement
+# failure (retryable with a longer window) from a hard error (server crash, etc.).
+GENAI_LOG="$(mktemp)"
+SWEEP_FAILURES=0
+SWEEP_SUCCESSES=0
+genai_perf_run() {   # <conc> <ctx> <interval> <artifact_subdir>
+    local conc="$1" ctx="$2" interval="$3" subdir="$4"
+    # shellcheck disable=SC2086
+    docker run --rm --net=host \
+        -e NVIDIA_DISABLE_REQUIRE=1 \
+        -e HF_TOKEN \
+        -e HUGGINGFACE_HUB_TOKEN \
+        -e HF_ENDPOINT \
+        -v "$RESULTS_DIR:/work/results" \
+        -w /work \
+        "$TRITON_SDK_IMAGE" \
+        genai-perf profile \
+        -m "$MODEL_NAME" \
+        --endpoint-type chat \
+        --streaming \
+        -u "$URL" \
+        --num-prompts "$NUM_PROMPTS" \
+        --synthetic-input-tokens-mean "$ctx" \
+        --output-tokens-mean "$OUTPUT_TOKENS" \
+        --concurrency "$conc" \
+        --artifact-dir "results/${subdir}" \
+        --measurement-interval "$interval" \
+        --stability-percentage 999 \
+        $TOKENIZER_ARG \
+        -- --max-trials 3 2>&1 | tee "$GENAI_LOG"
+    return "${PIPESTATUS[0]}"
+}
+
 # ── Sweep: context size × concurrency ─────────────────────────────────────────
 IFS=',' read -ra CONC_ARRAY <<< "$CONCURRENCY_LIST"
 
@@ -136,36 +195,42 @@ for CTX in "${CTX_LIST[@]}"; do
             TOKENIZER_ARG="--tokenizer $TOKENIZER_NAME"
         fi
 
-        # shellcheck disable=SC2086
-        docker run --rm --net=host \
-            -e NVIDIA_DISABLE_REQUIRE=1 \
-            -e HF_TOKEN \
-            -e HUGGINGFACE_HUB_TOKEN \
-            -e HF_ENDPOINT \
-            -v "$RESULTS_DIR:/work/results" \
-            -w /work \
-            "$TRITON_SDK_IMAGE" \
-            genai-perf profile \
-            -m "$MODEL_NAME" \
-            --endpoint-type chat \
-            --streaming \
-            -u "$URL" \
-            --num-prompts "$NUM_PROMPTS" \
-            --synthetic-input-tokens-mean "$CTX" \
-            --output-tokens-mean "$OUTPUT_TOKENS" \
-            --concurrency "$CONC" \
-            --artifact-dir "results/${ARTIFACT_SUBDIR}" \
-            --measurement-interval "$MEASUREMENT_INTERVAL" \
-            --stability-percentage 999 \
-            $TOKENIZER_ARG \
-            -- --max-trials 3
+        # Run; on an unstable-measurement failure (genai-perf couldn't complete enough
+        # requests in the window — common for reasoning models or slow/bandwidth-bound
+        # hardware at high concurrency), retry this level once with a doubled window.
+        # This is the fail-safe net that catches whatever the reasoning table above misses.
+        rc=0
+        genai_perf_run "$CONC" "$CTX" "$MEASUREMENT_INTERVAL" "$ARTIFACT_SUBDIR" || rc=$?
+        if [ "$rc" -ne 0 ] && grep -qiE 'stable measurement|measurement[ -]interval' "$GENAI_LOG"; then
+            retry_interval=$(( MEASUREMENT_INTERVAL >= 120000 ? MEASUREMENT_INTERVAL * 2 : 240000 ))
+            echo "  ⚠ Unstable measurement at concurrency=${CONC} (window ${MEASUREMENT_INTERVAL}ms) — retrying once at ${retry_interval}ms..."
+            rc=0
+            genai_perf_run "$CONC" "$CTX" "$retry_interval" "$ARTIFACT_SUBDIR" || rc=$?
+        fi
 
-        echo "  Done: concurrency=${CONC}, input_tokens=${CTX}"
+        if [ "$rc" -ne 0 ]; then
+            echo "  ✗ genai-perf failed at concurrency=${CONC}, input_tokens=${CTX} (rc=${rc}) — continuing"
+            SWEEP_FAILURES=$((SWEEP_FAILURES + 1))
+        else
+            echo "  Done: concurrency=${CONC}, input_tokens=${CTX}"
+            SWEEP_SUCCESSES=$((SWEEP_SUCCESSES + 1))
+        fi
     done
 done
+
+rm -f "$GENAI_LOG" 2>/dev/null || true
 
 echo ""
 echo "=============================================="
 echo "genai-perf benchmarks completed."
+echo "  Levels passed: ${SWEEP_SUCCESSES}, failed: ${SWEEP_FAILURES}"
 echo "Results saved to $RESULTS_DIR"
 echo "=============================================="
+
+# Exit non-zero only if NO concurrency level produced data (a real, total failure).
+# A partial sweep (e.g. conc 1/4/8 pass, 16/32 fail) still yields usable data and is
+# reported as success so the harness keeps it.
+if [ "$SWEEP_SUCCESSES" -eq 0 ]; then
+    exit 1
+fi
+exit 0
