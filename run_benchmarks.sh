@@ -1796,14 +1796,11 @@ ENVEOF
                     "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors"
                 ;;
             flux2_dev|flux2_dev_multigpu|flux2_dev_distorch2|flux2_dev_2k|flux2_dev_multigpu_2k|flux2_dev_distorch2_2k)
-                # Choose text encoder based on per-GPU VRAM (ComfyUI uses single GPU)
-                PER_GPU_VRAM=$((TOTAL_VRAM / GPU_COUNT))
-                if [ "$PER_GPU_VRAM" -ge 48 ]; then
-                    FLUX2_TEXT_ENC="mistral_3_small_flux2_bf16.safetensors"
-                else
-                    FLUX2_TEXT_ENC="mistral_3_small_flux2_fp8.safetensors"
-                    echo -e "  ${YELLOW}Note: Using FP8 text encoder (${PER_GPU_VRAM} GB per-GPU VRAM).${NC}"
-                fi
+                # The flux2 workflow JSON references the FP8 text encoder by name, so we
+                # must download exactly that. The previous VRAM-gated choice fetched the
+                # bf16 encoder on >=48 GB GPUs (Spark, RTX PRO 6000), which never matched
+                # the workflow's CLIPLoader -> HTTP 400 "value not in list" at submission.
+                FLUX2_TEXT_ENC="mistral_3_small_flux2_fp8.safetensors"
                 download_if_missing "$COMFY_WORK_DIR" "models/diffusion_models" \
                     "https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/diffusion_models/flux2_dev_fp8mixed.safetensors"
                 download_if_missing "$COMFY_WORK_DIR" "models/vae" \
@@ -1845,9 +1842,18 @@ COMFYENV
             target_cmd "printf '${_COMFY_OVERRIDE}' > \"${COMFY_WORK_DIR}/docker-compose.override.yml\""
         fi
 
+        # CUDA/torch wheel selection (mirrors comfy_ui/init.sh). cu128 ships FP8 kernels
+        # for sm_120 only; GB10/DGX Spark is sm_121 and needs CUDA 13 + torch cu130 or FP8
+        # workflows (Flux.2) fail. Select cu130 for sm_12x>=1, keep cu128 for sm_120/RTX.
+        COMFY_BUILD_ENV=""
+        if [ "$IS_BLACKWELL" = "true" ] && [ "${COMPUTE_CAP%.*}" = "12" ] && [ "${COMPUTE_CAP#*.}" != "0" ]; then
+            COMFY_BUILD_ENV="export CUDA_VERSION=13.0.2 TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130; "
+            echo -e "  ${GREEN}sm_${COMPUTE_CAP/./} detected → building ComfyUI on CUDA 13 / torch cu130 (FP8 support)${NC}"
+        fi
+
         # Build container (smart_build skips if fingerprint unchanged)
         echo -e "  ${BLUE}Building ComfyUI container on target machine (smart build)...${NC}"
-        target_cmd "bash -c 'source \"$COMFY_WORK_DIR/scripts/lib/smart_build.sh\" && cd \"$COMFY_WORK_DIR\" && smart_build'"
+        target_cmd "${COMFY_BUILD_ENV}bash -c 'source \"$COMFY_WORK_DIR/scripts/lib/smart_build.sh\" && cd \"$COMFY_WORK_DIR\" && smart_build'"
 
         # Launch
         echo -e "  ${BLUE}Starting ComfyUI on target machine...${NC}"
