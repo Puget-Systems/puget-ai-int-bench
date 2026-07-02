@@ -77,6 +77,7 @@ DTYPE_OVERRIDE=""      # Force model dtype (e.g. float16 — Intel XPU vLLM cann
 MAX_MODEL_LEN=""       # Cap vLLM --max-model-len (KV-cache headroom for large-context models)
 RESUME_DIR=""          # Prior results dir: skip (pack, model) entries that have a .done marker there
 SKIP_DRIVER_CHECK=false  # Bypass the host-driver vs container-CUDA gate (debug only)
+DOCKER_COMPOSE=""      # Resolved Compose command on the target ("docker compose" or "docker-compose")
 
 # ============================================
 # Load Config File (if exists)
@@ -284,7 +285,7 @@ bench_driver_ok() {
 # an integration tech sees instead of 200 raw log lines with no interpretation.
 diagnose_failure() {
     local work_dir="$1" label="${2:-server}" logs
-    logs=$(target_cmd "cd \"$work_dir\" && docker compose logs --tail 200 2>/dev/null" 2>/dev/null) || true
+    logs=$(target_cmd "cd \"$work_dir\" && ${DOCKER_COMPOSE} logs --tail 200 2>/dev/null" 2>/dev/null) || true
     echo "$logs" | tail -60
     echo ""
     echo -e "  ${YELLOW}── Diagnosis ─────────────────────────────────────────────${NC}"
@@ -345,6 +346,15 @@ run_doctor() {
         fi
     else
         echo -e "  ${RED}✗${NC} Docker not installed"; fail=$((fail+1))
+    fi
+
+    # Docker Compose (v2 plugin or v1 standalone) — the bench drives everything
+    # through it, and Ubuntu's docker.io package omits the plugin.
+    if detect_docker_compose; then
+        echo -e "  ${GREEN}✓${NC} Docker Compose: ${DOCKER_COMPOSE}"
+    else
+        echo -e "  ${RED}✗${NC} Docker Compose missing (no 'docker compose' plugin or 'docker-compose')"
+        echo -e "        Fix (Ubuntu): sudo apt-get install -y docker-compose-v2"; fail=$((fail+1))
     fi
 
     # GPU + interconnect
@@ -422,6 +432,26 @@ run_doctor() {
         return 0
     fi
     echo -e "  ${GREEN}✓ All checks passed — ready to benchmark.${NC}"
+    return 0
+}
+
+# detect_docker_compose — resolve a working Compose command ON THE TARGET into
+# DOCKER_COMPOSE. Prefer the v2 plugin ("docker compose"); fall back to the v1
+# standalone ("docker-compose"). Ubuntu's `docker.io` package ships the engine
+# and the legacy image builder but NOT the compose plugin, so `docker compose`
+# fails there — and it fails cryptically ("unknown shorthand flag: 'd' in -d",
+# because docker reparses the args after not finding the plugin), only after the
+# image has already built. Detecting up front lets us fail with a real fix.
+# Returns 1 (and leaves DOCKER_COMPOSE empty) when neither is available.
+detect_docker_compose() {
+    if target_cmd "docker compose version >/dev/null 2>&1"; then
+        DOCKER_COMPOSE="docker compose"
+    elif target_cmd "docker-compose version >/dev/null 2>&1"; then
+        DOCKER_COMPOSE="docker-compose"
+    else
+        DOCKER_COMPOSE=""
+        return 1
+    fi
     return 0
 }
 
@@ -929,7 +959,19 @@ PREFLIGHT_STDIN
     echo -e "${GREEN}✓ Remote server provisioned and ready.${NC}"
 fi
 
-
+# Resolve the Compose command up front (before any expensive build/clone) so a
+# box missing the Compose v2 plugin fails here with a fix, not mid-run.
+if ! detect_docker_compose; then
+    echo ""
+    echo -e "${RED}✗ Docker Compose is not available on the target.${NC}"
+    echo -e "  The engine is installed but neither ${BLUE}docker compose${NC} (v2 plugin) nor"
+    echo -e "  ${BLUE}docker-compose${NC} (v1) works. Ubuntu's ${YELLOW}docker.io${NC} package omits the plugin."
+    echo -e "  Fix (Ubuntu): ${GREEN}sudo apt-get install -y docker-compose-v2${NC}"
+    echo -e "  or install Docker's official packages (docker-ce + docker-compose-plugin):"
+    echo -e "  ${GREEN}https://docs.docker.com/engine/install/ubuntu/${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓ Compose command: ${DOCKER_COMPOSE}${NC}"
 
 # ============================================
 # 1. Acquire App Pack Repository (Remote)
@@ -1812,7 +1854,7 @@ ENVEOF
         # 'ui' (open-webui) and 'brain' (autogen, slow build) services that the
         # benchmark never touches — starting them rebuilds the autogen image on
         # every model. genai-perf hits inference:8000 directly.
-        target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null; docker compose up -d inference"
+        target_cmd "cd \"$WORK_DIR\" && ${DOCKER_COMPOSE} down 2>/dev/null; ${DOCKER_COMPOSE} up -d inference"
         echo ""
 
         echo -e "  ${YELLOW}Waiting for model to load by invoking vllm_monitor remotely (timeout ${MODEL_LOAD_TIMEOUT}s)...${NC}"
@@ -1829,7 +1871,7 @@ ENVEOF
             BENCH_OK=false
             # Tear down the failed/hung container and free the GPUs before the next
             # model — otherwise a stuck server holds VRAM into the following run.
-            target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null" || true
+            target_cmd "cd \"$WORK_DIR\" && ${DOCKER_COMPOSE} down 2>/dev/null" || true
             reap_workers_and_wait_gpu
             continue
         fi
@@ -1844,7 +1886,7 @@ ENVEOF
         if ! run_genai_perf_client "vllm" "${BENCH_URL_BASE}:8000" "$API_MODEL" "$BENCH_CONCURRENCY" "$BENCH_RESULTS_DIR"; then
             echo -e "  ${RED}✗ genai-perf failed for ${BENCH_MODEL}${NC}"
             echo -e "  ${YELLOW}Capturing vLLM logs for debugging...${NC}"
-            target_cmd "cd \"$WORK_DIR\" && docker compose logs --tail 200 > /tmp/vllm_error_${BENCH_MODEL//\//_}.log"
+            target_cmd "cd \"$WORK_DIR\" && ${DOCKER_COMPOSE} logs --tail 200 > /tmp/vllm_error_${BENCH_MODEL//\//_}.log"
             FAILED_BENCHMARKS+=("${BENCH_MODEL} (genai-perf failed)")
             BENCH_OK=false
         fi
@@ -1852,7 +1894,7 @@ ENVEOF
 
         # Tear down this model and free the GPUs before the next one. Plain `down`
         # keeps the external shared_vllm_cache volume (model weights) intact.
-        target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null" || true
+        target_cmd "cd \"$WORK_DIR\" && ${DOCKER_COMPOSE} down 2>/dev/null" || true
         reap_workers_and_wait_gpu
 
         # Optionally prune model from shared cache to save disk
@@ -1893,15 +1935,15 @@ ENVEOF
         # Pull the latest Ollama image before starting — prevents 412 manifest
         # errors when pulling newer models that require a newer Ollama version.
         echo -e "  ${BLUE}Pulling latest Ollama container image...${NC}"
-        target_cmd "cd \"$WORK_DIR\" && docker compose pull" 2>/dev/null || true
-        target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null; docker compose up -d"
+        target_cmd "cd \"$WORK_DIR\" && ${DOCKER_COMPOSE} pull" 2>/dev/null || true
+        target_cmd "cd \"$WORK_DIR\" && ${DOCKER_COMPOSE} down 2>/dev/null; ${DOCKER_COMPOSE} up -d"
 
         echo -e "  ${YELLOW}Waiting for Ollama API...${NC}"
         # Remote wait loop - ensure bash is used on remote for brace expansion
         if ! target_cmd "bash -c 'for i in {1..60}; do curl -s --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'"; then
              echo -e "  ${RED}✗ Ollama API not responding. Skipping.${NC}"
              diagnose_failure "$WORK_DIR" "Ollama"
-             target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null"
+             target_cmd "cd \"$WORK_DIR\" && ${DOCKER_COMPOSE} down 2>/dev/null"
              FAILED_BENCHMARKS+=("$BENCH_OLLAMA_TAG (Ollama failed)")
              continue
         fi
@@ -1909,7 +1951,7 @@ ENVEOF
         echo -e "  ${BLUE}Pulling remote model: ${BENCH_OLLAMA_TAG}...${NC}"
         if ! target_cmd "docker exec puget_ollama ollama pull \"$BENCH_OLLAMA_TAG\""; then
              echo -e "  ${RED}✗ Failed to pull remote model. Skipping.${NC}"
-             target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null"
+             target_cmd "cd \"$WORK_DIR\" && ${DOCKER_COMPOSE} down 2>/dev/null"
              FAILED_BENCHMARKS+=("$BENCH_OLLAMA_TAG (pull failed)")
              continue
         fi
@@ -1931,7 +1973,7 @@ ENVEOF
         # name as-is for the benchmark, but skip tokenizer-based metrics.
         if ! run_genai_perf_client "ollama" "${BENCH_URL_BASE}:11434" "$BENCH_OLLAMA_TAG" "$BENCH_CONCURRENCY" "$BENCH_RESULTS_DIR"; then
              echo -e "  ${RED}✗ genai-perf failed for ${BENCH_OLLAMA_TAG}${NC}"
-             target_cmd "cd \"$WORK_DIR\" && docker compose logs --tail 200 > /tmp/ollama_error_${BENCH_MODEL//\//_}.log"
+             target_cmd "cd \"$WORK_DIR\" && ${DOCKER_COMPOSE} logs --tail 200 > /tmp/ollama_error_${BENCH_MODEL//\//_}.log"
              FAILED_BENCHMARKS+=("${BENCH_OLLAMA_TAG} (genai-perf failed)")
              BENCH_OK=false
         fi
@@ -1940,7 +1982,7 @@ ENVEOF
         echo -e "  ${BLUE}Pruning $BENCH_OLLAMA_TAG from shared Ollama data...${NC}"
         target_cmd "docker exec puget_ollama ollama rm \"$BENCH_OLLAMA_TAG\"" 2>/dev/null || true
 
-        target_cmd "cd \"$WORK_DIR\" && docker compose down -v 2>/dev/null"
+        target_cmd "cd \"$WORK_DIR\" && ${DOCKER_COMPOSE} down -v 2>/dev/null"
         target_cmd "docker volume prune -f 2>/dev/null; docker image prune -f 2>/dev/null" || true
 
     elif [ "$BENCH_PACK" = "comfy_ui" ]; then
@@ -2032,14 +2074,14 @@ COMFYENV
         # Fix ownership on volume-mount dirs (container runs as UID 999, GID 1500)
         target_cmd "mkdir -p \"$COMFY_WORK_DIR/output\" \"$COMFY_WORK_DIR/input\" \"$COMFY_WORK_DIR/custom_nodes\""
         target_cmd "chmod -R 777 \"$COMFY_WORK_DIR/output\" \"$COMFY_WORK_DIR/input\" 2>/dev/null || true"
-        target_cmd "cd \"$COMFY_WORK_DIR\" && docker compose down 2>/dev/null; docker compose up -d"
+        target_cmd "cd \"$COMFY_WORK_DIR\" && ${DOCKER_COMPOSE} down 2>/dev/null; ${DOCKER_COMPOSE} up -d"
 
         # Wait for API (port 8188)
         echo -e "  ${YELLOW}Waiting for ComfyUI API on port 8188...${NC}"
         if ! target_cmd "bash -c 'for i in {1..60}; do curl -s --max-time 3 http://localhost:8188/api/system_stats >/dev/null 2>&1 && exit 0; sleep 5; done; exit 1'"; then
             echo -e "  ${RED}✗ ComfyUI API not responding after 300s. Skipping.${NC}"
             diagnose_failure "$COMFY_WORK_DIR" "ComfyUI"
-            target_cmd "cd \"$COMFY_WORK_DIR\" && docker compose down 2>/dev/null"
+            target_cmd "cd \"$COMFY_WORK_DIR\" && ${DOCKER_COMPOSE} down 2>/dev/null"
             FAILED_BENCHMARKS+=("$BENCH_MODEL (ComfyUI failed to start)")
             continue
         fi
@@ -2052,7 +2094,7 @@ COMFYENV
             BENCH_OK=false
         fi
 
-        target_cmd "cd \"$COMFY_WORK_DIR\" && docker compose down -v 2>/dev/null"
+        target_cmd "cd \"$COMFY_WORK_DIR\" && ${DOCKER_COMPOSE} down -v 2>/dev/null"
         # Prune ComfyUI models (they are stored in the work dir)
         echo -e "  ${BLUE}Pruning ComfyUI models for ${BENCH_CHOICE}...${NC}"
         target_cmd "rm -rf \"$COMFY_WORK_DIR\"" 2>/dev/null || true
