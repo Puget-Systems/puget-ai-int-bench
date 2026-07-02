@@ -1746,6 +1746,15 @@ ENVEOF
             _OVERRIDE+="    privileged: true\n"
             _OVERRIDE+="    devices:\n      - /dev/dri:/dev/dri\n      - /dev/kfd:/dev/kfd\n"
             _ENV+="      - VLLM_TARGET_DEVICE=rocm\n      - NCCL_P2P_DISABLE=1\n      - HIP_FORCE_DEV_KERNARG=1\n"
+        elif [ "$GPU_VENDOR" = "intel" ]; then
+            # Intel XPU: the LLM-Scaler image reaches the GPU through the DRI render
+            # node. Without this device mapping the container sees zero XPU devices
+            # and vLLM aborts at startup with "Failed to infer device type" /
+            # "XPU device count is zero". Mirrors the app-pack's docker-compose.intel.yml
+            # (which install.sh layers on, but the bench writes its own override).
+            _OVERRIDE="services:\n  inference:\n"
+            _OVERRIDE+="    deploy: {}\n"
+            _OVERRIDE+="    devices:\n      - /dev/dri:/dev/dri\n"
         else
             _OVERRIDE="services:\n  inference:\n"
             # NVIDIA multi-GPU: choose the NCCL transport by interconnect.
@@ -2053,6 +2062,15 @@ ENVEOF
 DOCKERFILE=Dockerfile.rocm
 COMFYENV
             _COMFY_OVERRIDE="services:\n  app:\n    deploy: {}\n    user: root\n    privileged: true\n    devices:\n      - /dev/dri:/dev/dri\n      - /dev/kfd:/dev/kfd\n    environment:\n      - CLI_ARGS=--listen 0.0.0.0 --preview-method auto\n"
+            target_cmd "printf '${_COMFY_OVERRIDE}' > \"${COMFY_WORK_DIR}/docker-compose.override.yml\""
+        # Intel XPU: build the XPU Dockerfile and pass the DRI render node, mirroring
+        # the app-pack's comfy docker-compose.intel.yml (smart_build reads DOCKERFILE
+        # from .env). Without /dev/dri the container can't see the Arc GPU.
+        elif [ "$GPU_VENDOR" = "intel" ]; then
+            target_cmd "cat > \"$COMFY_WORK_DIR/.env\"" <<COMFYENV
+DOCKERFILE=Dockerfile.xpu
+COMFYENV
+            _COMFY_OVERRIDE="services:\n  app:\n    deploy: {}\n    user: root\n    devices:\n      - /dev/dri:/dev/dri\n    environment:\n      - CLI_ARGS=--listen 0.0.0.0 --preview-method auto\n"
             target_cmd "printf '${_COMFY_OVERRIDE}' > \"${COMFY_WORK_DIR}/docker-compose.override.yml\""
         fi
 
