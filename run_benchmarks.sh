@@ -1173,9 +1173,14 @@ declare -a TEST_MATRIX=()
 # We can't interactively prompt the user from a remote bash session easily, so we parse options locally.
 get_vllm_model_info() {
     local choice="$1"
-    # Execute vllm_model_select.sh functions remotely and capture ALL variables
+    # Execute vllm_model_select.sh functions remotely and capture ALL variables.
+    # Redirect stdin from /dev/null: the "Custom" menu entry runs `read -p` for a
+    # model ID, and with the prompt suppressed by >/dev/null that read would
+    # silently consume the operator's terminal input and hang the enumeration
+    # (looks like a frozen cursor after picking "Run ALL"). </dev/null makes the
+    # Custom/Skip entries hit EOF and return non-zero (correctly excluded).
     local remote_out
-    remote_out=$(target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\"; detect_gpus >/dev/null; source \"$PACK_ROOT/scripts/lib/vllm_model_select.sh\"; if select_vllm_model \"$choice\" >/dev/null 2>&1; then echo \"OK|\$VLLM_MODEL_ID|\$VLLM_IMAGE|\$VLLM_GPU_COUNT|\$VLLM_GPU_MEM_UTIL|\$VLLM_DTYPE|\$VLLM_MAX_CTX|\$VLLM_REASONING_ARGS|\$VLLM_EXTRA_ARGS|\$VLLM_TOOL_CALL_ARGS|\$VLLM_THINKING_ARGS\"; else echo \"FAIL\"; fi'")
+    remote_out=$(target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\"; detect_gpus >/dev/null; source \"$PACK_ROOT/scripts/lib/vllm_model_select.sh\"; if select_vllm_model \"$choice\" >/dev/null 2>&1 </dev/null; then echo \"OK|\$VLLM_MODEL_ID|\$VLLM_IMAGE|\$VLLM_GPU_COUNT|\$VLLM_GPU_MEM_UTIL|\$VLLM_DTYPE|\$VLLM_MAX_CTX|\$VLLM_REASONING_ARGS|\$VLLM_EXTRA_ARGS|\$VLLM_TOOL_CALL_ARGS|\$VLLM_THINKING_ARGS\"; else echo \"FAIL\"; fi' </dev/null")
     
     if [[ "$remote_out" == FAIL* || -z "$remote_out" ]]; then
         return 1
@@ -1233,6 +1238,7 @@ define_run_all_matrix() {
     # Ask the live menu how many entries it has (MENU_MAX) so adding/removing models
     # in the app-pack flows through automatically — don't hardcode the upper bound.
     local _c _menu_max
+    echo -e "  ${BLUE}Enumerating available models for this hardware...${NC}"
     _menu_max=$(target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\" >/dev/null 2>&1; detect_gpus >/dev/null 2>&1; source \"$PACK_ROOT/scripts/lib/vllm_model_select.sh\" >/dev/null 2>&1; show_vllm_model_menu >/dev/null 2>&1; echo \${MENU_MAX:-12}'" 2>/dev/null)
     [[ "$_menu_max" =~ ^[0-9]+$ ]] || _menu_max=12
     for _c in $(seq 1 "$_menu_max"); do
@@ -1483,6 +1489,12 @@ else
         4)
             RUN_ALL=true
             define_run_all_matrix
+            echo ""
+            echo "  Test matrix (${#TEST_MATRIX[@]} benchmarks):"
+            for entry in ${TEST_MATRIX[@]+"${TEST_MATRIX[@]}"}; do
+                IFS='|' read -r e_pack e_choice e_name e_vram e_tag e_conc <<< "$entry"
+                echo -e "    • ${GREEN}${e_pack}${NC} → ${e_name}"
+            done
             ;;
         *) echo -e "${RED}Invalid selection.${NC}"; exit 1 ;;
     esac
