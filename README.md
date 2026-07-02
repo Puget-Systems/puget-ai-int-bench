@@ -86,12 +86,33 @@ To orchestrate a *separate* box over SSH instead of running on it, add `--host U
 | `--dry-run` | `false` | Validate setup without launching containers |
 | `--concurrency LIST` | `1,4,8,16` | Comma-separated concurrency levels (LLM only) |
 | `--context-lengths LIST` | *(none)* | Comma-separated input token sizes to sweep (e.g. `4096,32768,131072`) |
+| `--repo URL` | *(GitHub)* | App Pack repo URL **or local path** (useful for testing branch work) |
 | `--branch NAME` | `main` | App Pack git branch to clone |
+| `--resume DIR` | *(none)* | Skip (pack, model) entries already completed in a prior results dir |
+| `--skip-driver-check` | `false` | Bypass the host-driver ↔ container-CUDA compatibility gate |
 | `--input-tokens N` | `500` | Default input token count (overridden by `--context-lengths`) |
 | `--output-tokens N` | `500` | Max generation length (LLM only) |
 | `--num-prompts N` | `50` | Prompts per concurrency level (LLM only) |
+| `--measurement-interval MS` | `30000` | genai-perf measurement window (auto-widened to 120s for reasoning models) |
+| `--request-timeout S` | *(none)* | Per-request timeout for genai-perf — extend for thinking models |
+| `--dtype TYPE` | *(auto)* | Force model dtype (e.g. `float16` — Intel XPU cannot serve bfloat16) |
+| `--max-model-len N` | *(auto)* | Cap vLLM `--max-model-len` (KV-cache headroom on large-context models) |
 | `--comfy-iterations N` | `10` | Number of images per ComfyUI benchmark run |
+| `--fresh-cache` | `false` | Clear model caches before running (default: keep cached models) |
+| `--skip-checksum` | `false` | Skip the app-pack `checksums.md5` integrity check |
+| `--hf-token TOKEN` | *(auto)* | HuggingFace token (normally auto-discovered — see Model Caching) |
 | `--ssh-key PATH` | *(none)* | Path to SSH private key |
+
+### Driver ↔ Model Compatibility
+
+Different models resolve to different container images, and those images need
+different minimum NVIDIA drivers (CUDA 13 `cu130` images → driver ≥ 580; CUDA
+12.8+ stable images → ≥ 570). The bench reads each model's requirement from the
+app-pack (`scripts/list_models.sh` manifest / `min_driver_for_image()`), checks
+the installed driver **before launching the container**, and SKIPs incompatible
+models with a plain-language message instead of failing ten minutes into a load
+with `no kernel image is available`. `./run_benchmarks.sh --doctor` reports up
+front which image lines the installed driver supports.
 
 ### Config File
 
@@ -118,7 +139,15 @@ Infrastructure caching is **auto-detected** — no flags needed on the lab netwo
 
 - **Olah HF Mirror** (port 8090): caches HuggingFace model weights. The bench probes it and sets `HF_ENDPOINT` automatically when it answers.
 - **Squid HTTP Proxy** (port 3128): generic HTTP / Docker layer caching, auto-detected the same way.
-- Both run on the DGX Spark, provisioned via [puget-hypervisor-devops](https://github.com/Puget-Systems/puget-hypervisor-devops) Terraform (`olah_mirror` + `docker_cache_proxy`). Override the host with `PUGET_CACHE_HOST=<host>` or `--cache-proxy`; off-network the bench silently falls back to direct downloads.
+- Both run on the DGX Spark, provisioned via [puget-hypervisor-devops](https://github.com/Puget-Systems/puget-hypervisor-devops) Terraform (`olah_mirror` + `docker_cache_proxy`). Override the host with `PUGET_CACHE_HOST=<host>` or `--cache-proxy`. Off-network the bench falls back to direct downloads; in an interactive session it asks first (direct pulls can be 40–120 GB).
+
+**Gated models + the mirror:** the Olah mirror forwards your `Authorization`
+header to HuggingFace, so an HF token and the cache work **together** — gated
+models download through the mirror and get cached like everything else. The
+bench probes this at startup (`/api/whoami-v2` through the mirror) and only
+bypasses the mirror if the probe fails, telling you so. A `401` on a gated
+model means no/invalid token; a `403` means the token is valid but the account
+hasn't accepted that model's license on huggingface.co.
 
 ## Architecture
 
@@ -162,7 +191,7 @@ Infrastructure caching is **auto-detected** — no flags needed on the lab netwo
 | Input tokens | 500 | Synthetic prompt length |
 | Output tokens | 500 | Max generation length |
 | Num prompts | 50 | Prompts per concurrency level |
-| Measurement interval | 120s | Duration of each measurement window |
+| Measurement interval | 30s | Duration of each measurement window (auto-widened to 120s for reasoning/thinking models) |
 
 ## Repository Structure
 
@@ -195,33 +224,53 @@ puget-ai-int-bench/
 
 ## "Run ALL" Default Matrix
 
-When `--run-all` is specified, the following models are tested (filtered by available VRAM). Model choices map 1:1 to the app-pack menus.
+When `--run-all` is specified, the model list comes **live from the app-pack**
+— the bench enumerates `scripts/list_models.sh` (a versioned TSV manifest of
+every model the app-pack menus offer, already VRAM-gated for this hardware)
+and additionally skips models whose container image needs a newer driver than
+the box has. Adding a model to the app-pack menus adds it to the bench with no
+bench-side change. To see exactly what would run on a box:
+
+```bash
+./run_benchmarks.sh --run-all --dry-run       # matrix preview, no containers
+```
+
+The tables below are a **snapshot** of the NVIDIA menus at the time of writing
+— the manifest, not this README, is authoritative.
 
 ### Team LLM (vLLM)
 
-| # | Model | HF ID | Min VRAM | Notes |
+| # | Model | HF ID | Min VRAM | Min driver |
 |---|---|---|---|---|
-| 1 | Qwen 3 (8B) | `Qwen/Qwen3-8B` | 16 GB | Fast, single GPU, always runs |
-| 2 | Qwen 3 (32B FP8) | `Qwen/Qwen3-32B-FP8` | 40 GB | Near-lossless quality |
-| 3 | Qwen 3.5 35B MoE AWQ | `cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit` | 22 GB | 256K ctx |
-| 4 | Qwen 3.5 122B MoE AWQ | `cyankiwi/Qwen3.5-122B-A10B-AWQ-4bit` | 80 GB | Flagship, 128K ctx |
-| 5 | DeepSeek R1 70B AWQ | `Valdemardi/DeepSeek-R1-Distill-Llama-70B-AWQ` | 40 GB | Reasoning specialist |
-| 6 | Nemotron 3 Nano 30B | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` | 20 GB | NVFP4, always runs |
-| 7 | Nemotron 3 Super 120B | `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` | 80 GB | NVFP4 flagship |
-| 8 | Gemma 4 26B MoE AWQ | `cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit` | 20 GB | Google MoE, auto-skipped |
+| 1 | Qwen 3.6 35B MoE AWQ | `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit` | 22 GB | 580 (cu130) |
+| 2 | Qwen 3.6 27B Dense AWQ | `cyankiwi/Qwen3.6-27B-AWQ-INT4` | 18 GB | 580 (cu130) |
+| 3 | Qwen 3.5 35B MoE AWQ | `cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit` | 22 GB | 580 (cu130) |
+| 4 | Qwen 3.5 122B MoE AWQ | `cyankiwi/Qwen3.5-122B-A10B-AWQ-4bit` | 80 GB | 580 (cu130) |
+| 5 | DeepSeek R1 70B AWQ | `Valdemardi/DeepSeek-R1-Distill-Llama-70B-AWQ` | 40 GB | 570 (stable) |
+| 6 | Nemotron 3 Nano 30B | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` | 20 GB | 580 (cu130) |
+| 7 | Nemotron 3 Super 120B | `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` | 80 GB | 580 (cu130) |
+| 8 | Gemma 4 26B MoE AWQ | `cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit` | 20 GB | 580 (cu130) |
+| 9 | GPT-OSS 20B MXFP4 | `openai/gpt-oss-20b` | 16 GB | 570 (stable) |
+| 10 | GPT-OSS 120B MXFP4 | `openai/gpt-oss-120b` | 80 GB | 570 (stable) |
 
+AMD and Intel have their own vendor menus (FP8-online and FP16-only
+respectively) — see `vllm_menu_amd.sh` / `vllm_menu_intel.sh` in the app-pack.
 
-### Personal LLM (Ollama)
+### Personal LLM (Ollama — NVIDIA/Intel)
 
-| # | Model | Tag | Min VRAM | Notes |
-|---|---|---|---|---|
-| 1 | Qwen 3 (8B) | `qwen3:8b` | 5 GB | Fast, Low VRAM, always runs |
-| 2 | Qwen 3 (32B) | `qwen3:32b` | 20 GB | Best Quality, Single GPU |
-| 3 | DeepSeek R1 (70B) | `deepseek-r1:70b` | 42 GB | Flagship Reasoning, Dual GPU |
-| 4 | Llama 4 Scout | `llama4:scout` | 63 GB | Multimodal (text+image), Dual GPU |
-| 5 | Nemotron 3 Nano (30B) | `nemotron-3-nano:30b` | 24 GB | NVIDIA MoE Reasoning, Single GPU |
-| 6 | Nemotron 3 Super | `nemotron-3-super` | 96 GB | NVIDIA Flagship MoE, Multi-GPU |
-| 7 | Gemma 4 (31B) | `gemma4:31b` | 20 GB | Google, Dense Instruct, Single GPU |
+| # | Model | Tag | Min VRAM |
+|---|---|---|---|
+| 1 | Qwen 3.6 (35B MoE) | `qwen3.6:35b` | 24 GB |
+| 2 | Qwen 3.6 (27B Dense) | `qwen3.6:27b` | 18 GB |
+| 3 | DeepSeek R1 (70B) | `deepseek-r1:70b` | 42 GB |
+| 4 | Llama 4 Scout | `llama4:scout` | 63 GB |
+| 5 | Nemotron 3 Nano (30B) | `nemotron-3-nano:30b` | 24 GB |
+| 6 | Nemotron 3 Super | `nemotron-3-super` | 96 GB |
+| 7 | Gemma 4 (31B) | `gemma4:31b` | 20 GB |
+
+> On AMD, the `personal_llm` pack now ships **llama.cpp** (GGUF) instead of
+> Ollama; the bench does not yet have a llama.cpp client path and reports those
+> entries as not-benchable rather than silently testing the wrong engine.
 
 
 ### ComfyUI (Image Gen)
@@ -248,7 +297,7 @@ See [`findings/`](findings/) for detailed results and analysis.
 
 ## Known Issues
 
-- **Gemma 4 + vLLM:** Blocked upstream — vLLM does not yet support packed MoE expert weights. Auto-skipped by the orchestrator. Use the Ollama `gemma4:31b` variant instead.
+- **Gemma 4 + vLLM on Intel XPU:** Blocked upstream — the XPU backend lacks packed MoE expert weight support; auto-skipped on Intel only (NVIDIA/AMD attempt it honestly). Use the Ollama `gemma4:31b` variant instead.
 - **vLLM + GB10:** NVFP4 MoE kernels crash at concurrency > 1 on sm_120 architecture. Use Ollama as a workaround.
 - **Ollama silent CPU fallback:** If Docker loses GPU context (e.g., after VM suspend/resume), Ollama falls back to CPU without warning. Fix: `docker compose down && docker compose up -d`.
 - **Triton SDK on GB10:** Emits a harmless "unsupported GPU" warning. Benchmarks work fine — genai-perf only uses CPU for HTTP request generation.
@@ -259,6 +308,17 @@ See [`findings/`](findings/) for detailed results and analysis.
 MIT — See [LICENSE](LICENSE)
 
 ## Changelog
+
+### v1.6.0
+
+- **Driver ↔ model compatibility gate** — each model's container image carries a minimum NVIDIA driver (cu130 → ≥580, stable → ≥570, defined once in the app-pack's `min_driver_for_image()`). The bench checks the installed driver *before* launching and SKIPs incompatible models with a plain-language fix; `--doctor` reports which image lines the driver supports. Override with `--skip-driver-check`.
+- **Model manifest is the single source of truth** — the bench consumes the app-pack's new `scripts/list_models.sh` (versioned TSV: pack, engine, menu #, model id, size, min driver, image). The three divergent hardcoded Ollama lists are gone; interactive Ollama menus come live from the app-pack like vLLM already did. Old app-pack branches without the manifest fall back to live menu enumeration.
+- **HF token no longer bypasses the cache** — the Olah mirror forwards `Authorization` headers, so gated models download *through* the mirror. The bench probes auth-forwarding at startup and only bypasses (loudly) if the probe fails. Previously any token silently disabled weight caching for every model.
+- **Failure diagnosis** — on container/API failures the bench greps the log tail for known signatures (driver/CUDA mismatch, driver/library mismatch after upgrade, GPU OOM/KV-cache, gated-repo 401/403, NCCL/P2P, unrecognized architecture) and prints a one-paragraph diagnosis + fix above the raw logs.
+- **`--resume DIR`** — a `--run-all` that died at model 6/10 can resume: completed entries write a `.done` marker; point `--resume` at the prior results dir to skip them.
+- **Cache misses are loud** — if the lab cache is unreachable, an interactive run now asks before pulling 40–120 GB direct (non-interactive runs keep the old fall-through).
+- **Temp-dir cleanup re-enabled** — per-run temp trees (pack copies, scratch) are removed on exit; model weights persist in shared volumes / the model cache as before.
+- **One-offs archived** — `run_spark_*.sh` moved to `archive/`; `run_benchmarks.sh` remains the single entry point.
 
 ### v1.5.0
 

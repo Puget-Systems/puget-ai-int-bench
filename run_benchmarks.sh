@@ -75,6 +75,8 @@ REQUEST_TIMEOUT=""     # Per-request timeout (seconds) for genai-perf — extend
 GPU_COUNT_OVERRIDE=""  # Force a specific GPU count for custom models (e.g. 1 = single-GPU TP=1)
 DTYPE_OVERRIDE=""      # Force model dtype (e.g. float16 — Intel XPU vLLM cannot serve bfloat16)
 MAX_MODEL_LEN=""       # Cap vLLM --max-model-len (KV-cache headroom for large-context models)
+RESUME_DIR=""          # Prior results dir: skip (pack, model) entries that have a .done marker there
+SKIP_DRIVER_CHECK=false  # Bypass the host-driver vs container-CUDA gate (debug only)
 
 # ============================================
 # Load Config File (if exists)
@@ -120,6 +122,8 @@ while [[ "$#" -gt 0 ]]; do
         --gpu-count) GPU_COUNT_OVERRIDE="$2"; shift ;;
         --dtype) DTYPE_OVERRIDE="$2"; shift ;;
         --max-model-len) MAX_MODEL_LEN="$2"; shift ;;
+        --resume) RESUME_DIR="$2"; shift ;;
+        --skip-driver-check) SKIP_DRIVER_CHECK=true ;;
         -h|--help)
             echo -e "${BLUE}Puget Systems AI App Pack — Automated Benchmark Suite${NC}"
             echo ""
@@ -145,6 +149,8 @@ while [[ "$#" -gt 0 ]]; do
             echo "  --comfy-iterations N Number of images per ComfyUI benchmark run (default: 10)"
             echo "  --context-lengths L  Comma-separated input token sizes to benchmark (e.g. 4096,32768,131072)"
             echo "  --fresh-cache        Clear model caches before running (default: keep cached models)"
+            echo "  --resume DIR         Skip (pack, model) entries already completed in a prior results dir"
+            echo "  --skip-driver-check  Bypass the host-driver vs container-CUDA compatibility gate"
             exit 0
             ;;
         *) echo -e "${RED}Unknown parameter: $1. Use --help for usage.${NC}"; exit 1 ;;
@@ -245,6 +251,71 @@ resolve_hf_token() {
     return 0
 }
 
+# ── Driver ↔ container-CUDA compatibility gate ────────────────────────────
+# Different models resolve to different container images (stable vs cu130-nightly),
+# and those images need different minimum host drivers. The mapping lives in the
+# app-pack (gpu_detect.sh min_driver_for_image); this local copy is the fallback
+# for older app-pack branches that predate it. Keep the two in sync.
+bench_min_driver_for_image() {
+    case "$1" in
+        *cu130*)            echo 580 ;;   # CUDA 13.0 (Blackwell nightly line)
+        *cu128*|*cu129*)    echo 570 ;;
+        vllm/vllm-openai:*) echo 570 ;;   # stable/latest/nightly are CUDA 12.8+ builds
+        *) ;;                             # ROCm/XPU/unknown: no NVIDIA driver gate
+    esac
+}
+
+# bench_driver_ok IMAGE — return 0 when the host driver can run IMAGE (or when
+# either side is unknown; a missing data point must never block a benchmark —
+# the container launch will surface a real mismatch, which we then classify).
+# Sets BENCH_DRIVER_MIN for the caller's error message.
+bench_driver_ok() {
+    BENCH_DRIVER_MIN=$(bench_min_driver_for_image "$1")
+    [ "$SKIP_DRIVER_CHECK" = true ] && return 0
+    [ -z "$BENCH_DRIVER_MIN" ] && return 0
+    [ "${GPU_VENDOR:-nvidia}" = "nvidia" ] || return 0
+    local major="${DRIVER_VERSION:-}"; major="${major%%.*}"
+    [[ "$major" =~ ^[0-9]+$ ]] || return 0
+    [ "$major" -ge "$BENCH_DRIVER_MIN" ]
+}
+
+# diagnose_failure WORK_DIR LABEL — dump the container log tail, then grep it for
+# known failure signatures and print a plain-language diagnosis + fix. This is what
+# an integration tech sees instead of 200 raw log lines with no interpretation.
+diagnose_failure() {
+    local work_dir="$1" label="${2:-server}" logs
+    logs=$(target_cmd "cd \"$work_dir\" && docker compose logs --tail 200 2>/dev/null" 2>/dev/null) || true
+    echo "$logs" | tail -60
+    echo ""
+    echo -e "  ${YELLOW}── Diagnosis ─────────────────────────────────────────────${NC}"
+    if echo "$logs" | grep -qiE 'no kernel image is available'; then
+        echo -e "  ${RED}Driver/CUDA mismatch:${NC} the container's CUDA build has no kernels for this GPU"
+        echo -e "  or the host driver is too old for the container's CUDA runtime."
+        echo -e "  Fix: upgrade the NVIDIA driver (cu130 images need ≥580), or pick a model"
+        echo -e "  that uses the stable image. Installed driver: ${DRIVER_VERSION:-unknown}."
+    elif echo "$logs" | grep -qiE 'driver/library version mismatch'; then
+        echo -e "  ${RED}Driver was updated but the old kernel module is still loaded.${NC}"
+        echo -e "  Fix: reboot the box, then re-run."
+    elif echo "$logs" | grep -qiE 'CUDA out of memory|HIP out of memory|max seq len.*KV cache|No available memory for the cache'; then
+        echo -e "  ${RED}Out of GPU memory (weights + KV cache don't fit).${NC}"
+        echo -e "  Fix: re-run with --max-model-len 32768 (or lower), or a smaller model."
+    elif echo "$logs" | grep -qiE '401|403|gated|GatedRepo|Access to model.*restricted'; then
+        echo -e "  ${RED}HuggingFace auth failure — this model is gated.${NC}"
+        echo -e "  Fix: set a token with access (HF_TOKEN in ~/.config/puget-bench/bench.conf,"
+        echo -e "  or huggingface-cli login), then re-run. Token status: ${HF_TOKEN_SOURCE:-none}."
+    elif echo "$logs" | grep -qiE 'NCCL|P2P.*(hang|fail|timeout)'; then
+        echo -e "  ${RED}NCCL / GPU peer-to-peer failure during multi-GPU init.${NC}"
+        echo -e "  Fix: usually NCCL_P2P_DISABLE=1 (the bench sets this on PCIe-only boxes);"
+        echo -e "  if it persists, re-run with --gpu-count 1 to isolate."
+    elif echo "$logs" | grep -qiE 'model type .* not recognized|does not recognize this architecture|has no attribute'; then
+        echo -e "  ${RED}The model architecture is newer than this container's vLLM/transformers.${NC}"
+        echo -e "  Fix: the model likely needs the nightly image — check VLLM_IMAGE in the app-pack menu."
+    else
+        echo -e "  No known signature matched — see the full ${label} log above."
+    fi
+    echo -e "  ${YELLOW}──────────────────────────────────────────────────────────${NC}"
+}
+
 # run_doctor — read-only readiness check (invoked by --doctor; never runs a benchmark).
 # Verifies a box can run the suite: Docker, GPU + interconnect, disk, port 8000, the
 # lab cache, and HF token. Lets an integration specialist confirm readiness unaided.
@@ -283,6 +354,22 @@ run_doctor() {
         n=$(echo "$g" | grep -c .)
         echo -e "  ${GREEN}✓${NC} NVIDIA GPUs: ${n}"
         echo "$g" | sed 's/^/        /'
+        # Driver ↔ container-CUDA readiness: which model image lines can this driver run?
+        local drv drv_major
+        drv=$(echo "$g" | head -1 | awk -F', ' '{print $3}')
+        drv_major="${drv%%.*}"
+        if [[ "$drv_major" =~ ^[0-9]+$ ]]; then
+            if [ "$drv_major" -ge 580 ]; then
+                echo -e "  ${GREEN}✓${NC} Driver ${drv} — supports ALL model images (CUDA 12 stable + CUDA 13 cu130)"
+            elif [ "$drv_major" -ge 570 ]; then
+                echo -e "  ${YELLOW}⚠${NC} Driver ${drv} — CUDA-12 models OK, but cu130 models (Blackwell nightly"
+                echo -e "      line: Qwen3.5/3.6, Nemotron NVFP4, Gemma4) need driver ≥580 and will be SKIPPED."
+                echo -e "      Fix: upgrade the driver (app-pack setup.sh offers this) and reboot."; warn=$((warn+1))
+            else
+                echo -e "  ${YELLOW}⚠${NC} Driver ${drv} is older than 570 — current vLLM images (CUDA 12.8+) may fail."
+                echo -e "      Fix: upgrade the driver (app-pack setup.sh offers this) and reboot."; warn=$((warn+1))
+            fi
+        fi
         if [ "${n:-0}" -gt 1 ]; then
             nvl=$(target_cmd "nvidia-smi topo -m 2>/dev/null | grep -E '^[[:space:]]*GPU[0-9]' | grep -oE 'NV[0-9]+' | head -1" 2>/dev/null)
             if [ -n "$nvl" ]; then
@@ -580,7 +667,7 @@ run_genai_perf_client() {
     # HF_ENDPOINT when a mirror exists — exporting it empty makes transformers use
     # "" as the endpoint and the tokenizer download fails ("Unrecognized model").
     local hf_env="HF_TOKEN='${HF_TOKEN}' HUGGINGFACE_HUB_TOKEN='${HF_TOKEN}'"
-    [ -n "${HF_MIRROR:-}" ] && hf_env="$hf_env HF_ENDPOINT='${HF_MIRROR}'"
+    [ -n "${HF_ENDPOINT_EFFECTIVE:-}" ] && hf_env="$hf_env HF_ENDPOINT='${HF_ENDPOINT_EFFECTIVE}'"
     target_cmd "export $hf_env; bash '$REMOTE_TEMP_DIR/run_genai_perf.sh' \
         --endpoint '$endpoint' \
         --url 'http://localhost:$port' \
@@ -758,7 +845,7 @@ if [ "$NEED_PREFLIGHT" = true ]; then
     if [ "$LOCAL_MODE" = true ]; then
         echo -e "${RED}✗ Docker and/or GPU drivers are missing on this machine.${NC}"
         echo "  In on-box mode, install them first — the App Pack installer handles this:"
-        echo "    curl -fsSL https://raw.githubusercontent.com/Puget-Systems/puget-docker-app-pack/main/setup.sh -o setup.sh && bash setup.sh"
+        echo "    curl -fsSL https://raw.githubusercontent.com/Puget-Systems/puget-docker-app-packs/main/setup.sh -o setup.sh && bash setup.sh"
         echo "  (Or pass --host USER@IP to provision a remote box over SSH.)"
         exit 1
     fi
@@ -851,10 +938,14 @@ echo ""
 echo -e "${YELLOW}[1/6] Acquiring App Pack repository on target machine...${NC}"
 
 REMOTE_TEMP_DIR=$(target_cmd "mktemp -d")
+# Remove the per-run temp tree on exit. Model weights are NOT lost: vLLM/Ollama
+# weights live in shared docker volumes and ComfyUI weights in MODEL_CACHE_DIR —
+# the temp dir only holds pack copies and scratch. Leaving it (the old behavior)
+# leaked multi-GB dirs into /tmp until the disk filled.
 cleanup() {
     echo ""
     echo -e "${YELLOW}Cleaning up remote temp directory...${NC}"
-# target_cmd "rm -rf \"$REMOTE_TEMP_DIR\"" >/dev/null 2>&1 || true
+    target_cmd "rm -rf \"$REMOTE_TEMP_DIR\"" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -945,14 +1036,20 @@ echo ""
 echo -e "${YELLOW}[3/6] Detecting hardware on target machine...${NC}"
 
 # We execute a small inline script remotely that sources gpu_detect.sh and prints key variables back to us
-GPU_INFO=$(target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\" && if detect_gpus; then echo \"OK|\$GPU_VENDOR|\$GPU_COUNT|\$TOTAL_VRAM|\$GPU_NAME|\$IS_BLACKWELL|\$COMPUTE_CAP|\$VRAM_GB\"; else echo \"FAIL\"; fi'")
+GPU_INFO=$(target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\" && if detect_gpus; then echo \"OK|\$GPU_VENDOR|\$GPU_COUNT|\$TOTAL_VRAM|\$GPU_NAME|\$IS_BLACKWELL|\$COMPUTE_CAP|\$VRAM_GB|\${DRIVER_VERSION:-}\"; else echo \"FAIL\"; fi'")
 
 if [[ "$GPU_INFO" == "FAIL" || -z "$GPU_INFO" ]]; then
     echo -e "${RED}✗ No GPUs detected on target machine. GPU benchmarks require NVIDIA, Intel, or AMD GPU drivers.${NC}"
     exit 1
 fi
 
-IFS='|' read -r status GPU_VENDOR GPU_COUNT TOTAL_VRAM GPU_NAME IS_BLACKWELL COMPUTE_CAP VRAM_GB <<< "$GPU_INFO"
+IFS='|' read -r status GPU_VENDOR GPU_COUNT TOTAL_VRAM GPU_NAME IS_BLACKWELL COMPUTE_CAP VRAM_GB DRIVER_VERSION <<< "$GPU_INFO"
+
+# Older app-pack branches predate DRIVER_VERSION in gpu_detect.sh — query it
+# directly so the driver↔CUDA gate still works against them.
+if [ -z "${DRIVER_VERSION:-}" ]; then
+    DRIVER_VERSION=$(target_cmd "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1" 2>/dev/null) || true
+fi
 
 # The NVIDIA (main) app-pack branch's gpu_detect.sh detects via nvidia-smi but
 # does not emit a vendor string. If detection succeeded with no vendor, it's
@@ -962,6 +1059,7 @@ if [ -z "${GPU_VENDOR:-}" ] && [ "${GPU_COUNT:-0}" -gt 0 ]; then
 fi
 
 echo -e "${GREEN}✓ Found ${GPU_COUNT}x ${GPU_NAME} (${TOTAL_VRAM} GB total) [vendor: ${GPU_VENDOR}]${NC}"
+[ -n "${DRIVER_VERSION:-}" ] && echo -e "${GREEN}✓ GPU driver: ${DRIVER_VERSION}${NC}"
 if [ "$GPU_VENDOR" = "amd" ]; then
     echo -e "${GREEN}  AMD GPU detected → using ROCm container paths${NC}"
 elif [ "$GPU_VENDOR" = "intel" ]; then
@@ -1004,8 +1102,38 @@ if [ -n "$_CACHE_HOST" ]; then
         if [ "$_CACHE_EXPLICIT" = true ]; then
             echo -e "${YELLOW}⚠ Cache host ${_CACHE_HOST} unreachable — direct downloads this run${NC}"
         else
-            echo -e "${BLUE}ℹ No lab cache reachable (${_CACHE_HOST}) — using direct downloads${NC}"
+            echo -e "${YELLOW}⚠ No lab cache reachable (${_CACHE_HOST}) — model downloads go DIRECT${NC}"
+            echo -e "${YELLOW}  On the lab network this usually means the cache VM is down or the host"
+            echo -e "  changed — check PUGET_CACHE_HOST / --cache-proxy. Off-network this is expected.${NC}"
         fi
+        # A tech at the console should get a chance to fix the cache instead of
+        # silently pulling 40-120 GB from the internet. Non-interactive runs
+        # (nohup, CI) keep the old fall-through behavior.
+        if [ -t 0 ] && [ "$DRY_RUN" = false ]; then
+            read -r -p "  Continue with direct downloads? [Y/n] " _cache_go
+            if [[ "$_cache_go" =~ ^[Nn]$ ]]; then
+                echo "  Aborting — bring up the cache (or pass --cache-proxy) and re-run."
+                exit 1
+            fi
+        fi
+    fi
+fi
+
+# ── HF mirror vs gated-model auth ──────────────────────────────────────────
+# History: gated models 401'd through the Olah mirror, and the old workaround
+# was "token present → bypass the mirror entirely", which silently gave up
+# weight caching whenever anyone had logged into huggingface-cli. Olah forwards
+# the Authorization header upstream, so token+mirror normally work TOGETHER —
+# probe it and only bypass when the mirror genuinely can't forward auth.
+HF_ENDPOINT_EFFECTIVE="${HF_MIRROR}"
+if [ -n "$HF_MIRROR" ] && [ -n "${HF_TOKEN:-}" ]; then
+    _auth_code=$(target_cmd "curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Authorization: Bearer ${HF_TOKEN}' '${HF_MIRROR}/api/whoami-v2'" 2>/dev/null) || _auth_code=""
+    if [ "$_auth_code" = "200" ]; then
+        echo -e "${GREEN}✓ HF mirror forwards auth — gated models download THROUGH the cache${NC}"
+    else
+        HF_ENDPOINT_EFFECTIVE=""
+        echo -e "${YELLOW}⚠ HF mirror does not forward auth (HTTP ${_auth_code:-none}) — bypassing the"
+        echo -e "  mirror so gated models can authenticate. Downloads are NOT cached this run.${NC}"
     fi
 fi
 
@@ -1056,6 +1184,47 @@ get_vllm_model_info() {
     return 0
 }
 
+# ── Model manifest (app-pack scripts/list_models.sh) ────────────────────────
+# Versioned TSV of every model the app-pack menus offer on this hardware —
+# the single source of truth for the personal_llm matrix and per-model driver
+# requirements. Older app-pack branches don't ship it; callers must handle a
+# non-zero return by falling back to the legacy enumeration.
+MODEL_MANIFEST=""
+MANIFEST_CONTRACT_SUPPORTED=1
+load_model_manifest() {
+    [ -n "$MODEL_MANIFEST" ] && return 0
+    target_cmd "[ -f \"$PACK_ROOT/scripts/list_models.sh\" ]" 2>/dev/null || return 1
+    MODEL_MANIFEST=$(target_cmd "bash \"$PACK_ROOT/scripts/list_models.sh\"" 2>/dev/null) || { MODEL_MANIFEST=""; return 1; }
+    local ver
+    ver=$(echo "$MODEL_MANIFEST" | head -1 | awk -F'\t' '$1=="#PUGET_MODEL_MANIFEST"{print $2}')
+    if [ "${ver:-0}" -gt "$MANIFEST_CONTRACT_SUPPORTED" ] 2>/dev/null; then
+        echo -e "${YELLOW}⚠ App-pack model manifest is contract v${ver}; this bench understands v${MANIFEST_CONTRACT_SUPPORTED}.${NC}"
+        echo -e "${YELLOW}  Update the bench (git pull) — falling back to legacy model enumeration.${NC}"
+        MODEL_MANIFEST=""
+        return 1
+    fi
+    [ -z "$ver" ] && { MODEL_MANIFEST=""; return 1; }
+    return 0
+}
+
+manifest_rows() {  # manifest_rows PACK — TSV rows for one pack
+    echo "$MODEL_MANIFEST" | awk -F'\t' -v p="$1" '$1==p'
+}
+
+# get_ollama_model_info CHOICE — resolve a personal_llm menu number through the
+# LIVE app-pack menu (single source of truth). Echoes "TAG|VRAM_GB".
+get_ollama_model_info() {
+    local choice="$1" out
+    out=$(target_cmd "bash -c 'export PUGET_NONINTERACTIVE=1; source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\"; detect_gpus >/dev/null 2>&1; source \"$PACK_ROOT/scripts/lib/ollama_model_select.sh\"; if select_ollama_model \"$choice\" >/dev/null 2>&1 </dev/null; then echo \"OK|\$OLLAMA_MODEL_TAG|\$OLLAMA_MODEL_VRAM_GB\"; else echo FAIL; fi'" 2>/dev/null)
+    [[ "$out" == OK* ]] || return 1
+    echo "${out#OK|}"
+    return 0
+}
+
+show_ollama_menu_remote() {
+    target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\" >/dev/null 2>&1; detect_gpus >/dev/null 2>&1; source \"$PACK_ROOT/scripts/lib/ollama_model_select.sh\" >/dev/null 2>&1; show_ollama_model_menu'"
+}
+
 define_run_all_matrix() {
     # ── Team LLM (vLLM) — enumerate the LIVE app-pack menu (single source of
     #    truth). select_vllm_model VRAM-gates each choice; get_vllm_model_info
@@ -1072,26 +1241,32 @@ define_run_all_matrix() {
         fi
     done
 
-    # ── Personal LLM (Ollama) — mirrors app-pack ollama_model_select.sh ─────
-    TEST_MATRIX+=("personal_llm|1|qwen3:8b|5|qwen3:8b|1")
-
-    if [ "$TOTAL_VRAM" -ge 20 ]; then
-        TEST_MATRIX+=("personal_llm|2|qwen3:32b|20|qwen3:32b|1")
-    fi
-    if [ "$TOTAL_VRAM" -ge 42 ]; then
-        TEST_MATRIX+=("personal_llm|3|deepseek-r1:70b|42|deepseek-r1:70b|1")
-    fi
-    if [ "$TOTAL_VRAM" -ge 63 ]; then
-        TEST_MATRIX+=("personal_llm|4|llama4:scout|63|llama4:scout|1")
-    fi
-    if [ "$TOTAL_VRAM" -ge 24 ]; then
-        TEST_MATRIX+=("personal_llm|5|nemotron-3-nano:30b|24|nemotron-3-nano:30b|1")
-    fi
-    if [ "$TOTAL_VRAM" -ge 96 ]; then
-        TEST_MATRIX+=("personal_llm|6|nemotron-3-super|96|nemotron-3-super|1")
-    fi
-    if [ "$TOTAL_VRAM" -ge 20 ]; then
-        TEST_MATRIX+=("personal_llm|7|gemma4:31b|20|gemma4:31b|1")
+    # ── Personal LLM — enumerate the LIVE app-pack manifest (single source of
+    #    truth; already VRAM-gated by the same select_* functions the installer
+    #    uses). Falls back to querying the menu directly on app-pack branches
+    #    that predate scripts/list_models.sh.
+    if load_model_manifest; then
+        local _row_engine _row
+        while IFS=$'\t' read -r _mp _row_engine _mc _mid _msize _mdrv _mimg _mgpus _mdt _mctx; do
+            [ -z "${_mid:-}" ] && continue
+            if [ "$_row_engine" = "ollama" ]; then
+                TEST_MATRIX+=("personal_llm|${_mc}|${_mid}|${_msize}|${_mid}|1")
+            else
+                # AMD personal_llm now ships llama.cpp — the bench has no
+                # llama.cpp client path yet, so surface that instead of
+                # silently benchmarking an engine the pack no longer uses.
+                echo -e "  ${YELLOW}⚠ personal_llm on ${GPU_VENDOR} uses ${_row_engine} — not yet benchable, skipping ${_mid}${NC}"
+            fi
+        done < <(manifest_rows personal_llm)
+    else
+        # Legacy fallback: enumerate the app-pack Ollama menu directly.
+        local _oc _oinfo
+        for _oc in $(seq 1 12); do
+            if _oinfo=$(get_ollama_model_info "$_oc"); then
+                IFS='|' read -r _otag _ovram <<< "$_oinfo"
+                TEST_MATRIX+=("personal_llm|${_oc}|${_otag}|${_ovram}|${_otag}|1")
+            fi
+        done
     fi
 
 
@@ -1167,61 +1342,11 @@ download_if_missing() {
         fi'"
 }
 
-show_ollama_model_menu() {
-    if [ "$TOTAL_VRAM" -ge 24 ]; then
-        echo "  1) Qwen 3.6 (35B MoE)    - Agentic coding, 256K ctx, thinking preservation (~24 GB) [New]"
-    else
-        echo -e "  1) Qwen 3.6 (35B MoE)    - ${RED}Requires ~24 GB VRAM (you have ${TOTAL_VRAM} GB)${NC}"
-    fi
-    if [ "$TOTAL_VRAM" -ge 42 ]; then
-        echo "  2) DeepSeek R1 (70B)     - Flagship Reasoning, Dual GPU (~42 GB)"
-    else
-        echo -e "  2) DeepSeek R1 (70B)     - ${RED}Requires ~42 GB VRAM (you have ${TOTAL_VRAM} GB)${NC}"
-    fi
-    if [ "$TOTAL_VRAM" -ge 63 ]; then
-        echo "  3) Llama 4 Scout         - Multimodal (text+image), Dual GPU (~63 GB)"
-    else
-        echo -e "  3) Llama 4 Scout         - ${RED}Requires ~63 GB VRAM (you have ${TOTAL_VRAM} GB)${NC}"
-    fi
-    if [ "$TOTAL_VRAM" -ge 24 ]; then
-        echo "  4) Nemotron 3 Nano (30B) - NVIDIA MoE Reasoning, Single GPU (~24 GB)"
-    else
-        echo -e "  4) Nemotron 3 Nano (30B) - ${RED}Requires ~24 GB VRAM (you have ${TOTAL_VRAM} GB)${NC}"
-    fi
-    if [ "$TOTAL_VRAM" -ge 96 ]; then
-        echo "  5) Nemotron 3 Super      - NVIDIA Flagship MoE, Multi-GPU (~96 GB)"
-    else
-        echo -e "  5) Nemotron 3 Super      - ${RED}Requires ~96 GB VRAM (you have ${TOTAL_VRAM} GB)${NC}"
-    fi
-    if [ "$TOTAL_VRAM" -ge 20 ]; then
-        echo "  6) Gemma 4 (31B)         - Google Dense Instruct, Single GPU (~20 GB)"
-    else
-        echo -e "  6) Gemma 4 (31B)         - ${RED}Requires ~20 GB VRAM (you have ${TOTAL_VRAM} GB)${NC}"
-    fi
-    echo "  7) Custom tag            - Enter an Ollama model tag"
-}
+# Ollama menus/selection come from the app-pack (show_ollama_menu_remote /
+# get_ollama_model_info above) — the bench used to keep its own copies, which
+# drifted into three inconsistent model lists. Do not re-add local lists here.
 
-select_ollama_model() {
-    local choice="$1"
-    OLLAMA_MODEL_TAG=""
-    OLLAMA_MODEL_VRAM_GB=0
-    case $choice in
-        1) OLLAMA_MODEL_TAG="qwen3.6:35b";        OLLAMA_MODEL_VRAM_GB=24 ;;
-        2) OLLAMA_MODEL_TAG="deepseek-r1:70b";    OLLAMA_MODEL_VRAM_GB=42 ;;
-        3) OLLAMA_MODEL_TAG="llama4:scout";        OLLAMA_MODEL_VRAM_GB=63 ;;
-        4) OLLAMA_MODEL_TAG="nemotron-3-nano:30b"; OLLAMA_MODEL_VRAM_GB=24 ;;
-        5) OLLAMA_MODEL_TAG="nemotron-3-super";    OLLAMA_MODEL_VRAM_GB=96 ;;
-        6) OLLAMA_MODEL_TAG="gemma4:31b";          OLLAMA_MODEL_VRAM_GB=20 ;;
-        7)
-            read -p "  Enter Ollama model tag: " OLLAMA_MODEL_TAG
-            OLLAMA_MODEL_VRAM_GB=0
-            ;;
-        *) return 1 ;;
-    esac
-    return 0
-}
-
-# Fetch vllm menu output from remote 
+# Fetch vllm menu output from remote
 show_vllm_menu_remote() {
     target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\" >/dev/null 2>&1; detect_gpus >/dev/null 2>&1; source \"$PACK_ROOT/scripts/lib/vllm_model_select.sh\" >/dev/null 2>&1; show_vllm_model_menu'"
 }
@@ -1251,7 +1376,11 @@ elif [ -n "$PACK" ]; then
             exit 1
         fi
         if [[ "$MODEL_CHOICE" =~ ^[0-9]+$ ]]; then
-            select_ollama_model "$MODEL_CHOICE"
+            if ! _oinfo=$(get_ollama_model_info "$MODEL_CHOICE"); then
+                echo -e "${RED}✗ Ollama menu choice ${MODEL_CHOICE} is invalid or needs more VRAM on this box.${NC}"
+                exit 1
+            fi
+            IFS='|' read -r OLLAMA_MODEL_TAG _ <<< "$_oinfo"
             TEST_MATRIX+=("personal_llm|${MODEL_CHOICE}|${OLLAMA_MODEL_TAG}|0|${OLLAMA_MODEL_TAG}|1")
         else
             TEST_MATRIX+=("personal_llm|0|${MODEL_CHOICE}|0|${MODEL_CHOICE}|1")
@@ -1309,15 +1438,22 @@ else
         2)
             PACK="personal_llm"
             echo ""
-            echo "  Select a model for Ollama:"
+            echo "  Select a model for Ollama (live app-pack menu):"
             echo ""
-            show_ollama_model_menu
+            show_ollama_menu_remote
             echo ""
-            read -p "  Select [1-7]: " MODEL_CHOICE
-            if select_ollama_model "$MODEL_CHOICE"; then
-                TEST_MATRIX+=("personal_llm|${MODEL_CHOICE}|${OLLAMA_MODEL_TAG}|0|${OLLAMA_MODEL_TAG}|1")
+            read -p "  Select a model number (or enter an Ollama tag directly): " MODEL_CHOICE
+            if [[ "$MODEL_CHOICE" =~ ^[0-9]+$ ]]; then
+                if _oinfo=$(get_ollama_model_info "$MODEL_CHOICE"); then
+                    IFS='|' read -r OLLAMA_MODEL_TAG _ <<< "$_oinfo"
+                    TEST_MATRIX+=("personal_llm|${MODEL_CHOICE}|${OLLAMA_MODEL_TAG}|0|${OLLAMA_MODEL_TAG}|1")
+                else
+                    echo -e "${RED}✗ Invalid selection (or insufficient VRAM for that model).${NC}"; exit 1
+                fi
+            elif [ -n "$MODEL_CHOICE" ]; then
+                TEST_MATRIX+=("personal_llm|0|${MODEL_CHOICE}|0|${MODEL_CHOICE}|1")
             else
-                echo -e "${RED}✗ Invalid selection.${NC}"; exit 1
+                echo "  No model selected. Exiting."; exit 0
             fi
             ;;
         3)
@@ -1426,13 +1562,23 @@ for entry in "${TEST_MATRIX[@]}"; do
         continue
     fi
 
+    SAFE_MODEL_NAME=$(echo "$BENCH_MODEL" | tr '/:' '_')
+
+    # --resume: skip entries that already completed in a prior results dir.
+    # Markers are written per (pack, model) on PASS, so a --run-all that died at
+    # model 6/10 can pick up where it left off instead of redoing everything.
+    if [ -n "$RESUME_DIR" ] && [ -f "$RESUME_DIR/${BENCH_PACK}_${SAFE_MODEL_NAME}/.done" ]; then
+        echo -e "  ${GREEN}✓ Already completed in ${RESUME_DIR} — skipping (remove the .done marker to redo).${NC}"
+        PASSED_BENCHMARKS+=("${BENCH_PACK}|${BENCH_MODEL} (from resume)")
+        continue
+    fi
+
     # Pre-flight: forcibly remove any stale bench containers left by aborted prior
     # runs, reap orphaned vLLM workers, and wait for the GPUs to be free so the
     # next model starts from a clean slate (prevents OOM / port-in-use wedges).
     target_cmd "docker rm -f puget_vllm puget_team_brain puget_team_webui puget_ollama 2>/dev/null; docker network prune -f 2>/dev/null" || true
     reap_workers_and_wait_gpu
 
-    SAFE_MODEL_NAME=$(echo "$BENCH_MODEL" | tr '/:' '_')
     BENCH_RESULTS_DIR="$MASTER_RESULTS_DIR/${BENCH_PACK}_${SAFE_MODEL_NAME}"
     mkdir -p "$BENCH_RESULTS_DIR"
 
@@ -1443,11 +1589,9 @@ for entry in "${TEST_MATRIX[@]}"; do
     fi
 
     if [ "$BENCH_PACK" = "team_llm" ]; then
-        # Determine HF_ENDPOINT: bypass caching mirror if HF_TOKEN is present to allow gating auth
-        hf_endpoint_val="${HF_MIRROR}"
-        if [ -n "$HF_TOKEN" ]; then
-            hf_endpoint_val=""
-        fi
+        # HF_ENDPOINT: the mirror, unless the auth-forwarding probe above showed the
+        # mirror can't pass gated-repo credentials through (then it's blank = direct).
+        hf_endpoint_val="${HF_ENDPOINT_EFFECTIVE}"
         if [[ "$BENCH_CHOICE" == "custom" || ! "$BENCH_CHOICE" =~ ^[0-9]+$ ]]; then
             # Custom model
             custom_image="latest"
@@ -1630,6 +1774,21 @@ ENVEOF
         # This honors VLLM_IMAGE from the .env we just wrote (the old code
         # hardcoded the base image and ignored the menu's choice).
         EFFECTIVE_IMG=$(target_cmd "grep -m1 '^VLLM_IMAGE=' \"$WORK_DIR/.env\" | cut -d= -f2-" 2>/dev/null)
+
+        # Driver ↔ container-CUDA gate: fail here in 2 seconds with a clear message
+        # instead of 10 minutes later with "no kernel image is available" in a log dump.
+        if ! bench_driver_ok "$EFFECTIVE_IMG"; then
+            echo -e "  ${YELLOW}⚠ SKIP: ${BENCH_MODEL} needs NVIDIA driver ≥${BENCH_DRIVER_MIN} for its container"
+            echo -e "    image (${EFFECTIVE_IMG}); this box has ${DRIVER_VERSION:-unknown}."
+            echo -e "    Fix: upgrade the driver (app-pack setup.sh offers this) and reboot,"
+            echo -e "    or pick a model on the stable image. Override: --skip-driver-check.${NC}"
+            echo "SKIPPED: driver ${DRIVER_VERSION:-unknown} < required ${BENCH_DRIVER_MIN} for ${EFFECTIVE_IMG}" > "$BENCH_RESULTS_DIR/SKIPPED.txt"
+            FAILED_BENCHMARKS+=("${BENCH_MODEL} (skipped — driver ${DRIVER_VERSION:-?} < ${BENCH_DRIVER_MIN} for ${EFFECTIVE_IMG})")
+            _BENCH_ELAPSED=$(( $(date +%s) - _BENCH_START ))
+            BENCH_TIMINGS+=("${BENCH_PACK}|${BENCH_MODEL}|${_BENCH_ELAPSED}")
+            continue
+        fi
+
         if ! ensure_vllm_image "$EFFECTIVE_IMG"; then
             FAILED_BENCHMARKS+=("${BENCH_MODEL} (image unavailable: ${EFFECTIVE_IMG:-none})")
             _BENCH_ELAPSED=$(( $(date +%s) - _BENCH_START ))
@@ -1653,7 +1812,7 @@ ENVEOF
 
         if ! target_cmd "curl -s --max-time 5 http://localhost:8000/v1/models > /dev/null 2>&1"; then
             echo -e "  ${RED}✗ vLLM API not responding. Skipping.${NC}"
-            target_cmd "cd \"$WORK_DIR\" && docker compose logs --tail 200"
+            diagnose_failure "$WORK_DIR" "vLLM"
             FAILED_BENCHMARKS+=("$BENCH_MODEL (vLLM failed)")
             BENCH_OK=false
             # Tear down the failed/hung container and free the GPUs before the next
@@ -1729,6 +1888,7 @@ ENVEOF
         # Remote wait loop - ensure bash is used on remote for brace expansion
         if ! target_cmd "bash -c 'for i in {1..60}; do curl -s --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'"; then
              echo -e "  ${RED}✗ Ollama API not responding. Skipping.${NC}"
+             diagnose_failure "$WORK_DIR" "Ollama"
              target_cmd "cd \"$WORK_DIR\" && docker compose down 2>/dev/null"
              FAILED_BENCHMARKS+=("$BENCH_OLLAMA_TAG (Ollama failed)")
              continue
@@ -1866,7 +2026,7 @@ COMFYENV
         echo -e "  ${YELLOW}Waiting for ComfyUI API on port 8188...${NC}"
         if ! target_cmd "bash -c 'for i in {1..60}; do curl -s --max-time 3 http://localhost:8188/api/system_stats >/dev/null 2>&1 && exit 0; sleep 5; done; exit 1'"; then
             echo -e "  ${RED}✗ ComfyUI API not responding after 300s. Skipping.${NC}"
-            target_cmd "cd \"$COMFY_WORK_DIR\" && docker compose logs --tail 20"
+            diagnose_failure "$COMFY_WORK_DIR" "ComfyUI"
             target_cmd "cd \"$COMFY_WORK_DIR\" && docker compose down 2>/dev/null"
             FAILED_BENCHMARKS+=("$BENCH_MODEL (ComfyUI failed to start)")
             continue
@@ -1890,6 +2050,8 @@ COMFYENV
     BENCH_TIMINGS+=("${BENCH_PACK}|${BENCH_MODEL}|${_BENCH_ELAPSED}")
     if [ "$BENCH_OK" = true ]; then
         PASSED_BENCHMARKS+=("${BENCH_PACK}|${BENCH_MODEL}")
+        # Completion marker consumed by --resume on a later run
+        touch "$BENCH_RESULTS_DIR/.done" 2>/dev/null || true
     fi
     echo -e "  ${GREEN}⏱  ${BENCH_PACK} → ${BENCH_MODEL}: $(format_duration $_BENCH_ELAPSED)${NC}"
     echo ""
