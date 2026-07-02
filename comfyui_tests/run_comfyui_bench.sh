@@ -72,24 +72,29 @@ fi
 PY_VERSION=$("$PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 echo -e "  ${GREEN}✓ Python ${PY_VERSION}${NC}"
 
-# Install missing deps into a local venv so we don't pollute the system
+# Install missing deps into a local venv so we don't pollute the system.
+# A venv is NOT portable: if a .venv was copied/rsync'd from another host, its
+# interpreter paths don't exist here and python/pip "cannot execute". Rebuild the
+# venv when it's missing OR its python doesn't actually run.
 VENV_DIR="$SCRIPT_DIR/.venv"
-if [ ! -d "$VENV_DIR" ]; then
+VENV_PY="$VENV_DIR/bin/python"
+if [ ! -x "$VENV_PY" ] || ! "$VENV_PY" -c "import sys" >/dev/null 2>&1; then
     echo -e "  ${BLUE}Creating venv at $VENV_DIR...${NC}"
+    rm -rf "$VENV_DIR"
     "$PYTHON" -m venv "$VENV_DIR"
 fi
 
 VENV_PY="$VENV_DIR/bin/python"
-VENV_PIP="$VENV_DIR/bin/pip"
 
-# Ensure deps are installed (idempotent)
+# Ensure deps are installed (idempotent). Use `python -m pip` rather than the pip
+# wrapper script — the wrapper's shebang can be stale, python -m pip can't be.
 MISSING_DEPS=()
 "$VENV_PY" -c "import requests" 2>/dev/null || MISSING_DEPS+=("requests")
 "$VENV_PY" -c "import websockets" 2>/dev/null || MISSING_DEPS+=("websockets")
 
 if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
     echo -e "  ${BLUE}Installing dependencies: ${MISSING_DEPS[*]}...${NC}"
-    "$VENV_PIP" install --quiet "${MISSING_DEPS[@]}"
+    "$VENV_PY" -m pip install --quiet "${MISSING_DEPS[@]}"
     echo -e "  ${GREEN}✓ Dependencies installed.${NC}"
 else
     echo -e "  ${GREEN}✓ Dependencies already satisfied.${NC}"
