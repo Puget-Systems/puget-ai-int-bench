@@ -311,6 +311,17 @@ diagnose_failure() {
     elif echo "$logs" | grep -qiE 'model type .* not recognized|does not recognize this architecture|has no attribute'; then
         echo -e "  ${RED}The model architecture is newer than this container's vLLM/transformers.${NC}"
         echo -e "  Fix: the model likely needs the nightly image — check VLLM_IMAGE in the app-pack menu."
+    elif echo "$logs" | grep -qiE 'UR_RESULT_ERROR_DEVICE_LOST|level_zero backend failed'; then
+        echo -e "  ${RED}The GPU crashed/reset mid-run (Level Zero DEVICE_LOST).${NC}"
+        echo -e "  The driver lost the device — usually a GPU hang or kernel driver crash, not a"
+        echo -e "  config problem. Check ${BLUE}sudo dmesg | tail -30${NC} for i915/xe GPU reset messages;"
+        echo -e "  a reboot is often needed before the GPU responds again. If it recurs on the"
+        echo -e "  same model, try --gpu-count 1 (single-GPU) to rule out multi-GPU sync issues."
+    elif echo "$logs" | grep -qiE 'Failed to infer device type|XPU device count is zero'; then
+        echo -e "  ${RED}The container cannot see the GPU at all.${NC}"
+        echo -e "  Device passthrough is missing/broken (e.g. /dev/dri not mapped, or the host"
+        echo -e "  driver is down). Verify the GPU on the host (clinfo / rocm-smi / nvidia-smi),"
+        echo -e "  then check the compose override maps the device into the container."
     else
         echo -e "  No known signature matched — see the full ${label} log above."
     fi
@@ -1222,7 +1233,7 @@ get_vllm_model_info() {
     # (looks like a frozen cursor after picking "Run ALL"). </dev/null makes the
     # Custom/Skip entries hit EOF and return non-zero (correctly excluded).
     local remote_out
-    remote_out=$(target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\"; detect_gpus >/dev/null; source \"$PACK_ROOT/scripts/lib/vllm_model_select.sh\"; if select_vllm_model \"$choice\" >/dev/null 2>&1 </dev/null; then echo \"OK|\$VLLM_MODEL_ID|\$VLLM_IMAGE|\$VLLM_GPU_COUNT|\$VLLM_GPU_MEM_UTIL|\$VLLM_DTYPE|\$VLLM_MAX_CTX|\$VLLM_REASONING_ARGS|\$VLLM_EXTRA_ARGS|\$VLLM_TOOL_CALL_ARGS|\$VLLM_THINKING_ARGS\"; else echo \"FAIL\"; fi' </dev/null")
+    remote_out=$(target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\"; detect_gpus >/dev/null; source \"$PACK_ROOT/scripts/lib/vllm_model_select.sh\"; if select_vllm_model \"$choice\" >/dev/null 2>&1 </dev/null; then echo \"OK|\$VLLM_MODEL_ID|\$VLLM_IMAGE|\$VLLM_GPU_COUNT|\$VLLM_GPU_MEM_UTIL|\$VLLM_DTYPE|\$VLLM_MAX_CTX|\$VLLM_REASONING_ARGS|\$VLLM_EXTRA_ARGS|\$VLLM_TOOL_CALL_ARGS|\$VLLM_THINKING_ARGS|\$VLLM_MODEL_SIZE_GB\"; else echo \"FAIL\"; fi' </dev/null")
     
     if [[ "$remote_out" == FAIL* || -z "$remote_out" ]]; then
         return 1
@@ -1653,6 +1664,7 @@ for entry in "${TEST_MATRIX[@]}"; do
         # HF_ENDPOINT: the mirror, unless the auth-forwarding probe above showed the
         # mirror can't pass gated-repo credentials through (then it's blank = direct).
         hf_endpoint_val="${HF_ENDPOINT_EFFECTIVE}"
+        BENCH_MODEL_SIZE_GB=0   # known weight size (GB) — drives the monitor's download % display
         if [[ "$BENCH_CHOICE" == "custom" || ! "$BENCH_CHOICE" =~ ^[0-9]+$ ]]; then
             # Custom model
             custom_image="latest"
@@ -1697,7 +1709,8 @@ HUGGINGFACE_TOKEN=${HF_TOKEN}
 ENVEOF
         else
             vllm_info=$(get_vllm_model_info "$BENCH_CHOICE") || { echo -e "${RED}✗ Required ${BENCH_MIN_VRAM}GB VRAM for choice $BENCH_CHOICE. Skip.${NC}"; continue; }
-            IFS='|' read -r status m_id m_img m_gpus m_mem m_dtype m_ctx m_reason m_extra m_tool m_thinking <<< "$vllm_info"
+            IFS='|' read -r status m_id m_img m_gpus m_mem m_dtype m_ctx m_reason m_extra m_tool m_thinking m_size <<< "$vllm_info"
+            [[ "${m_size:-}" =~ ^[0-9]+$ ]] && BENCH_MODEL_SIZE_GB="$m_size"
             BENCH_MODEL="$m_id" # update to true ID
             # Blackwell (sm_120) needs CUDA 13 kernels. Some menu models (DeepSeek 70B,
             # GPT-OSS) pin the stable v0.20.2 image which lacks them — force cu130-nightly.
@@ -1876,7 +1889,7 @@ ENVEOF
         echo -e "  ${YELLOW}Waiting for model to load by invoking vllm_monitor remotely (timeout ${MODEL_LOAD_TIMEOUT}s)...${NC}"
         # Bound the wait: a hung server (NCCL deadlock, OOM stall) would otherwise make
         # the monitor loop forever. On timeout, fall through to the API check below.
-        if ! target_cmd "timeout ${MODEL_LOAD_TIMEOUT} bash -c 'source \"$WORK_DIR/scripts/lib/vllm_monitor.sh\" && wait_for_vllm \"puget_vllm\" \"0\" \"${VLLM_STALL_SECONDS}\"'"; then
+        if ! target_cmd "timeout ${MODEL_LOAD_TIMEOUT} bash -c 'source \"$WORK_DIR/scripts/lib/vllm_monitor.sh\" && wait_for_vllm \"puget_vllm\" \"${BENCH_MODEL_SIZE_GB:-0}\" \"${VLLM_STALL_SECONDS}\"'"; then
             echo -e "  ${YELLOW}⚠ Model did not become ready within ${MODEL_LOAD_TIMEOUT}s (or monitor exited).${NC}"
         fi
 
