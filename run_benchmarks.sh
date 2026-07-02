@@ -317,6 +317,12 @@ diagnose_failure() {
         echo -e "  config problem. Check ${BLUE}sudo dmesg | tail -30${NC} for i915/xe GPU reset messages;"
         echo -e "  a reboot is often needed before the GPU responds again. If it recurs on the"
         echo -e "  same model, try --gpu-count 1 (single-GPU) to rule out multi-GPU sync issues."
+    elif echo "$logs" | grep -qiE 'shm_broadcast.*cancelled|RuntimeError: cancelled|Engine core initialization failed'; then
+        echo -e "  ${RED}Engine-core init failed — the API server gave up waiting on its workers.${NC}"
+        echo -e "  On multi-GPU boxes this is usually the tensor-parallel worker hanging or"
+        echo -e "  dying during distributed init (seen on XPU TP≥2 and PCIe-P2P setups)."
+        echo -e "  Isolate: re-run this model single-GPU —"
+        echo -e "  ${BLUE}./run_benchmarks.sh --pack team_llm --model <HF-id> --gpu-count 1${NC}"
     elif echo "$logs" | grep -qiE 'Failed to infer device type|XPU device count is zero'; then
         echo -e "  ${RED}The container cannot see the GPU at all.${NC}"
         echo -e "  Device passthrough is missing/broken (e.g. /dev/dri not mapped, or the host"
