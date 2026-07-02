@@ -29,7 +29,7 @@ Run the bench **directly on the GPU box** — copy the repo over (or clone it th
 
 ```bash
 # On the GPU box:
-git clone git@github.com:Puget-Systems/puget-ai-int-bench.git
+git clone https://github.com/Puget-Systems/puget-ai-int-bench.git
 cd puget-ai-int-bench
 
 # 1) Confirm the box is ready (Docker, GPU, disk, cache, port) — runs no benchmark
