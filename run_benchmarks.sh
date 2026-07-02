@@ -1283,9 +1283,14 @@ define_run_all_matrix() {
     echo -e "  ${BLUE}Enumerating available models for this hardware...${NC}"
     _menu_max=$(target_cmd "bash -c 'source \"$PACK_ROOT/scripts/lib/gpu_detect.sh\" >/dev/null 2>&1; detect_gpus >/dev/null 2>&1; source \"$PACK_ROOT/scripts/lib/vllm_model_select.sh\" >/dev/null 2>&1; show_vllm_model_menu >/dev/null 2>&1; echo \${MENU_MAX:-12}'" 2>/dev/null)
     [[ "$_menu_max" =~ ^[0-9]+$ ]] || _menu_max=12
+    # Store the RESOLVED model id (field 2 of "OK|id|image|...") as the display
+    # name — the menu number stays in the choice field for execution, but the
+    # matrix listing, results dirs, and resume markers key off the real model.
+    local _vinfo _vid
     for _c in $(seq 1 "$_menu_max"); do
-        if get_vllm_model_info "$_c" >/dev/null 2>&1; then
-            TEST_MATRIX+=("team_llm|${_c}|menu_choice_${_c}|0||$CONCURRENCY")
+        if _vinfo=$(get_vllm_model_info "$_c" 2>/dev/null); then
+            _vid=$(echo "$_vinfo" | cut -d'|' -f2)
+            TEST_MATRIX+=("team_llm|${_c}|${_vid:-menu_choice_${_c}}|0||$CONCURRENCY")
         fi
     done
 
@@ -1475,8 +1480,10 @@ else
             # any number and let the app-pack menu validate it; anything that
             # doesn't resolve (Custom, Skip, invalid) falls through to custom entry.
             read -p "  Select a model number (or 'c' for a custom HF ID): " MODEL_CHOICE
-            if [[ "$MODEL_CHOICE" =~ ^[0-9]+$ ]] && get_vllm_model_info "$MODEL_CHOICE" >/dev/null 2>&1; then
-                TEST_MATRIX+=("team_llm|${MODEL_CHOICE}|menu_choice_${MODEL_CHOICE}|0||${CONCURRENCY}")
+            if [[ "$MODEL_CHOICE" =~ ^[0-9]+$ ]] && _vinfo=$(get_vllm_model_info "$MODEL_CHOICE" 2>/dev/null); then
+                _vid=$(echo "$_vinfo" | cut -d'|' -f2)
+                echo -e "  ${GREEN}✓ Selected: ${_vid}${NC}"
+                TEST_MATRIX+=("team_llm|${MODEL_CHOICE}|${_vid:-menu_choice_${MODEL_CHOICE}}|0||${CONCURRENCY}")
             else
                 read -p "  Enter HuggingFace model ID (owner/model): " CUSTOM_MODEL
                 if [ -z "$CUSTOM_MODEL" ]; then echo "  No model selected. Exiting."; exit 0; fi
