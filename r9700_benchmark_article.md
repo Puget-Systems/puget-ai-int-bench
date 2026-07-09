@@ -6,9 +6,11 @@
 
 ## Introduction
 
-AMD's Radeon AI PRO R9700 is the first RDNA 4 professional card positioned squarely at local AI inference. At 32 GB of GDDR6 VRAM per card and 640 GB/s of memory bandwidth, it occupies a similar VRAM tier to Intel's Arc Pro B70 - but with higher bandwidth and AMD's mature ROCm software stack backing it. GPU pricing has risen across the board over the past year, but the relative positioning holds: at roughly $1,880 (configured pricing, July 2026; AMD's MSRP is $1,299), the R9700 substantially undercuts the NVIDIA RTX 5090 (~$4,130) while matching it on raw VRAM capacity. Two R9700 cards (~$3,760) deliver 64 GB of aggregate VRAM - the same total capacity as two RTX 5090s (~$8,260), at less than half the cost.
+In our [Intel Arc Pro B70 article](https://www.pugetsystems.com/labs/articles/intel-arc-pro-b70-multi-gpu-ai-inference-performance/), we explored what a VRAM-first, multi-GPU inference workstation looks like when built around Intel's 32 GB cards. This article asks the same question of AMD's entry in that fight.
 
-The question we set out to answer: **can two R9700 cards deliver production-quality local LLM inference and image generation - and does the economics of local inference make sense against today's cloud API pricing?**
+The Radeon AI PRO R9700 is the first RDNA 4 professional card positioned squarely at local AI inference. At 32 GB of GDDR6 VRAM per card and 640 GB/s of memory bandwidth, it occupies the same VRAM tier as the Arc Pro B70 - but with higher bandwidth and AMD's mature ROCm software stack backing it. At roughly $1,880 (configured pricing, July 2026; AMD's MSRP is $1,299), the R9700 substantially undercuts the NVIDIA RTX 5090 (~$4,130) while matching it on raw VRAM capacity. Two R9700 cards (~$3,760) deliver 64 GB of aggregate VRAM - the same total capacity as two RTX 5090s (~$8,260), at less than half the cost.
+
+The question we set out to answer: **can two R9700 cards deliver production-quality local LLM inference and image generation - and how does AMD's approach stack up against the four-card B70 configuration we already tested?**
 
 We installed two R9700 cards in a Puget Systems workstation and tested single-GPU baselines, dual-GPU pipeline parallelism, generative image workloads, and a 27B-parameter dense model that requires both cards to run. We also instrumented GPU power draw during every benchmark to calculate real-world cost-per-token - and compare it against today's frontier cloud APIs, where output pricing now ranges from $5/1M tokens (Claude Haiku 4.5) to $25/1M tokens (Claude Opus 4.8).
 
@@ -457,7 +459,7 @@ The AMD Radeon AI PRO R9700 delivers genuine AI inference capability on RDNA 4 s
 
 - **Dramatically cheaper than cloud APIs:** With measured GPU power draw of 151–260W for single-GPU workloads, local inference costs $0.21–$0.50 per million output tokens at single-user — dropping below $0.10/1M at 8 concurrent users. Even with full hardware amortization over 3 years, single-user local inference is **1.6–8× cheaper** than frontier APIs (Claude Haiku 4.5 at $5/1M through Claude Opus 4.8 at $25/1M) — and at 8 concurrent users the all-in cost falls to ~$0.60/1M, widening the gap to **8–40×**.
 
-- **Competitive value per dollar vs. competing hardware:** For the 27B model class, the R9700 2-card setup and the B70 4-card configuration land within 2% of each other on throughput per dollar at current (July 2026) pricing. The R9700 gets there with half the cards, slots, and GPU power budget; the B70 configuration brings double the aggregate VRAM. A year of GPU price inflation has erased the R9700's per-dollar lead from our original testing window — worth knowing if you're comparing against older coverage.
+- **Value per dollar is a genuine tie with Intel:** For the 27B model class, the R9700 2-card setup and the B70 4-card configuration land within 2% of each other on throughput per dollar at current (July 2026) pricing. The real differentiators are elsewhere: the R9700 gets there with half the cards, slots, and GPU power budget, while the B70 configuration brings double the aggregate VRAM for larger models down the road.
 
 Here is how the three cards compare side by side:
 
@@ -475,7 +477,7 @@ Here is how the three cards compare side by side:
 | **$/1M tokens (8B, electricity)** | $0.30 | Not measured | Not measured |
 | **Multi-GPU Method** | Pipeline Parallelism | Tensor Parallelism | Tensor Parallelism |
 
-The RTX 5090 is roughly 4–5× faster per GPU on decode-bound workloads, driven by nearly 3× the memory bandwidth. But GPU price inflation has hit NVIDIA hardest: at current pricing, two R9700 cards deliver the same aggregate VRAM for less than half the cost of two RTX 5090s. The B70 offers the most VRAM per dollar at 128 GB across four cards, but with lower per-card throughput.
+The RTX 5090 is roughly 4–5× faster per GPU on decode-bound workloads, driven by nearly 3× the memory bandwidth. But in today's supply-constrained market, that speed carries a steep premium: two R9700 cards deliver the same aggregate VRAM for less than half the cost of two RTX 5090s. The B70 offers the most VRAM per dollar at 128 GB across four cards, but with lower per-card throughput.
 
 The caveats are real but manageable: Tensor Parallelism failures in stock vLLM require using Pipeline Parallelism instead (a minor throughput penalty), and container permissions need explicit configuration. Once configured, the system ran with zero crashes or stability issues across our complete benchmark suite.
 
