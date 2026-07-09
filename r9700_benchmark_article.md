@@ -6,7 +6,7 @@
 
 ## Introduction
 
-AMD's Radeon AI PRO R9700 is the first RDNA 4 professional card positioned squarely at local AI inference. At 32 GB of GDDR6 VRAM per card and 640 GB/s of memory bandwidth, it occupies a similar VRAM tier to Intel's Arc Pro B70 - but with higher bandwidth and AMD's mature ROCm software stack backing it. At roughly $1,099, it undercuts the NVIDIA RTX 5090 ($1,999) while matching it on raw VRAM capacity. Two R9700 cards ($2,200) deliver 64 GB of aggregate VRAM - the same total capacity as two RTX 5090s ($4,000), at roughly half the cost.
+AMD's Radeon AI PRO R9700 is the first RDNA 4 professional card positioned squarely at local AI inference. At 32 GB of GDDR6 VRAM per card and 640 GB/s of memory bandwidth, it occupies a similar VRAM tier to Intel's Arc Pro B70 - but with higher bandwidth and AMD's mature ROCm software stack backing it. GPU pricing has risen across the board over the past year, but the relative positioning holds: at roughly $1,880 (configured pricing, July 2026; AMD's MSRP is $1,299), the R9700 substantially undercuts the NVIDIA RTX 5090 (~$4,130) while matching it on raw VRAM capacity. Two R9700 cards (~$3,760) deliver 64 GB of aggregate VRAM - the same total capacity as two RTX 5090s (~$8,260), at less than half the cost.
 
 The question we set out to answer: **can two R9700 cards deliver production-quality local LLM inference and image generation - and does the economics of local inference make sense against today's cloud API pricing?**
 
@@ -177,7 +177,7 @@ At 10.9 tok/s for a single user, this is approximately 650 words per minute of g
 
 The 91 ms ITL translates to approximately 11 tokens arriving per second from the user's perspective. While this is slower than the 8B models' 16–31 ms ITL, it is still smooth enough that output appears as a continuous stream rather than choppy bursts.
 
-For context: Qwen3.6-27B is one of the most capable open-weight dense models available as of mid-2026. Being able to run it locally in full FP16 precision on $2,200 worth of GPU hardware, without any quantization compromises, is a meaningful capability.
+For context: Qwen3.6-27B is one of the most capable open-weight dense models available as of mid-2026. Being able to run it locally in full FP16 precision on roughly $3,800 worth of GPU hardware, without any quantization compromises, is a meaningful capability.
 
 ---
 
@@ -251,15 +251,16 @@ At concurrency=8, every 8B model costs **under $0.10 per million output tokens**
 
 Beyond electricity, the hardware itself has a cost. Amortized over a 3-year workstation lifecycle at 8 hours/day, 5 days/week:
 
-| Component | Cost | Amortized $/hour |
+| Component | Cost (configured, July 2026) | Amortized $/hour |
 |-----------|-----:|:-----------------:|
-| 2× R9700 GPUs | $2,198 | $0.18/hr |
-| Full Workstation | ~$6,000 | $0.48/hr |
+| 2× R9700 GPUs | ~$3,760 | $0.31/hr |
+| Full Workstation | ~$7,600 | $0.61/hr |
 
 At DeepSeek R1 8B's throughput (61.1 tok/s single-user), the workstation generates **220K tokens/hour**. Including both amortized hardware and electricity:
 
-- **Total cost: ~$2.48 per million output tokens** (electricity + hardware amortization)
-- That's **2× cheaper than Claude Haiku 4.5**, **4× cheaper than Gemini 2.5 Pro**, and **10× cheaper than Claude Opus 4.8**
+- **Total cost: ~$3.05 per million output tokens** (electricity + hardware amortization)
+- That's **1.6× cheaper than Claude Haiku 4.5**, **3.3× cheaper than Gemini 2.5 Pro**, and **8× cheaper than Claude Opus 4.8**
+- At 8 concurrent users (317 tok/s → 1.14M tokens/hour), the all-in cost drops to **~$0.60 per million tokens** — 8× cheaper than Haiku 4.5 and over 40× cheaper than Opus 4.8
 
 The cost advantage is significant even when accounting for full hardware amortization - and the gap widens at higher utilization rates, where hardware costs are spread across more tokens while throughput multiplies.
 
@@ -317,9 +318,9 @@ Both the R9700 and the Arc Pro B70 target the same market - professional AI infe
 | **Memory Bandwidth** | 640 GB/s | 608 GB/s |
 | **AI TOPS (INT8)** | 766 TOPS | 367 TOPS |
 | **TDP** | 300W | 230W |
-| **MSRP** | ~$1,099 | $949 |
+| **Price per card (configured, July 2026)** | ~$1,880 | ~$1,110 |
 | **Cards Tested** | 2 | 4 |
-| **Total VRAM** | 64 GB (~$2,200) | 128 GB (~$3,800) |
+| **Total VRAM** | 64 GB (~$3,760) | 128 GB (~$4,450) |
 | **Inference Stack** | ROCm + vLLM | XPU + vLLM / LLM Scaler |
 | **Multi-GPU Method** | Pipeline Parallelism (PP) | Tensor Parallelism (TP) |
 
@@ -346,10 +347,10 @@ The comparison is more nuanced than a simple speed ranking:
 | **Throughput** | 10.9 tok/s | 13.2 tok/s |
 | **TTFT** | 363 ms | — (not measured) |
 | **ITL** | 91 ms | — |
-| **Total GPU Cost** | ~$2,200 (2 cards) | ~$3,800 (4 cards) |
-| **Throughput per $1K GPU** | 4.95 tok/s | 3.47 tok/s |
+| **Total GPU Cost (configured, July 2026)** | ~$3,760 (2 cards) | ~$4,450 (4 cards) |
+| **Throughput per $1K GPU** | 2.90 tok/s | 2.97 tok/s |
 
-The B70 4-card configuration delivers 21% higher raw throughput (13.2 vs. 10.9 tok/s), but it requires twice as many cards and costs 73% more. On a throughput-per-dollar basis, the R9700 2-card setup delivers **43% more tok/s per $1,000** of GPU investment.
+The B70 4-card configuration delivers 21% higher raw throughput (13.2 vs. 10.9 tok/s) for about 18% more GPU cost — on a throughput-per-dollar basis, the two configurations are effectively tied (within ~2%). The meaningful differences are elsewhere: the R9700 gets there with half the cards (two PCIe slots instead of four, 600W of GPU TDP instead of 920W), while the B70 configuration brings twice the aggregate VRAM.
 
 However, the B70's 4-card configuration offers 128 GB of total VRAM - enough for 35B MoE models and beyond - while the R9700 2-card setup is capped at 64 GB. Teams that need to run models larger than 27B FP16 will need either more R9700 cards or the B70's larger aggregate pool.
 
@@ -450,13 +451,13 @@ The AMD Radeon AI PRO R9700 delivers genuine AI inference capability on RDNA 4 s
 
 - **8B models at excellent speeds:** DeepSeek R1 8B hits 61.3 tok/s on a single card — faster than any Intel B70 result at the same parameter scale. Qwen3 8B, a thinking/reasoning model, delivers 37.4 tok/s with the best concurrency scaling tested (192 tok/s at 8 users). Llama 3.1 8B delivers 31.9 tok/s. Qwen2.5 3B reaches 81.1 tok/s. All are production-usable for interactive chat.
 
-- **27B models that won't fit on a single card:** Qwen3.6-27B Dense runs at 10.9 tok/s with a 363 ms TTFT on two R9700 cards. Full FP16 precision, no quantization required, on $2,200 of GPU hardware.
+- **27B models that won't fit on a single card:** Qwen3.6-27B Dense runs at 10.9 tok/s with a 363 ms TTFT on two R9700 cards. Full FP16 precision, no quantization required, on roughly $3,800 of GPU hardware.
 
 - **Reliable image generation:** 1024×1024 images in 3.5 seconds steady-state via Z-Image Turbo, with zero failures across 10 runs.
 
-- **Dramatically cheaper than cloud APIs:** With measured GPU power draw of 151–260W for single-GPU workloads, local inference costs $0.21–$0.50 per million output tokens at single-user — dropping below $0.10/1M at 8 concurrent users. Even with full hardware amortization over 3 years, the total cost is **2–10× cheaper** than the most affordable frontier APIs (Claude Haiku 4.5 at $5/1M, Gemini 2.5 Pro at $10/1M). Against flagship models like Claude Opus 4.8 ($25/1M), the gap is over 10×.
+- **Dramatically cheaper than cloud APIs:** With measured GPU power draw of 151–260W for single-GPU workloads, local inference costs $0.21–$0.50 per million output tokens at single-user — dropping below $0.10/1M at 8 concurrent users. Even with full hardware amortization over 3 years, single-user local inference is **1.6–8× cheaper** than frontier APIs (Claude Haiku 4.5 at $5/1M through Claude Opus 4.8 at $25/1M) — and at 8 concurrent users the all-in cost falls to ~$0.60/1M, widening the gap to **8–40×**.
 
-- **Strong value per dollar vs. competing hardware:** For the 27B model class, the R9700 2-card setup delivers 43% more throughput per dollar than the B70 4-card configuration, though with half the total VRAM capacity.
+- **Competitive value per dollar vs. competing hardware:** For the 27B model class, the R9700 2-card setup and the B70 4-card configuration land within 2% of each other on throughput per dollar at current (July 2026) pricing. The R9700 gets there with half the cards, slots, and GPU power budget; the B70 configuration brings double the aggregate VRAM. A year of GPU price inflation has erased the R9700's per-dollar lead from our original testing window — worth knowing if you're comparing against older coverage.
 
 Here is how the three cards compare side by side:
 
@@ -467,22 +468,22 @@ Here is how the three cards compare side by side:
 | **Memory Bandwidth** | 640 GB/s | 608 GB/s | 1,792 GB/s |
 | **AI TOPS (INT8)** | 766 TOPS | 367 TOPS | 3,352 TOPS (FP4 sparse) |
 | **TDP** | 300W | 230W | 575W |
-| **MSRP** | $1,099 | $949 | $1,999 |
-| **Tested Config VRAM** | 64 GB (2 cards, ~$2,200) | 128 GB (4 cards, ~$3,800) | 64 GB (2 cards, ~$4,000) |
+| **Price per card (configured, July 2026)** | ~$1,880 | ~$1,110 | ~$4,130 |
+| **Tested Config VRAM** | 64 GB (2 cards, ~$3,760) | 128 GB (4 cards, ~$4,450) | 64 GB (2 cards, ~$8,260) |
 | **8B FP16 tok/s (single card)** | 61.3 (DeepSeek R1) | 36.1 | ~140–200 |
 | **27B FP16 tok/s** | 10.9 (PP=2, 2 cards) | 13.2 (TP=4, 4 cards) | N/A (single), not tested (multi) |
 | **$/1M tokens (8B, electricity)** | $0.30 | Not measured | Not measured |
 | **Multi-GPU Method** | Pipeline Parallelism | Tensor Parallelism | Tensor Parallelism |
 
-The RTX 5090 is roughly 4–5× faster per GPU on decode-bound workloads, driven by nearly 3× the memory bandwidth. But two R9700 cards deliver the same aggregate VRAM at roughly half the cost. The B70 offers the most VRAM per dollar at 128 GB across four cards, but with lower per-card throughput.
+The RTX 5090 is roughly 4–5× faster per GPU on decode-bound workloads, driven by nearly 3× the memory bandwidth. But GPU price inflation has hit NVIDIA hardest: at current pricing, two R9700 cards deliver the same aggregate VRAM for less than half the cost of two RTX 5090s. The B70 offers the most VRAM per dollar at 128 GB across four cards, but with lower per-card throughput.
 
 The caveats are real but manageable: Tensor Parallelism failures in stock vLLM require using Pipeline Parallelism instead (a minor throughput penalty), and container permissions need explicit configuration. Once configured, the system ran with zero crashes or stability issues across our complete benchmark suite.
 
-For teams running FP16 models up to 27B parameters where **privacy, cost control, or volume** matter, the R9700 dual-card configuration is a compelling option. To put a concrete number on it: a team generating 5 million output tokens per month - roughly equivalent to a busy internal chatbot or coding assistant - would spend about $150/year on local inference (electricity + hardware amortization). The same volume through Claude Haiku 4.5 costs $300/year; through Gemini 2.5 Pro, $600/year; through Claude Opus 4.8, $1,500/year. The workstation pays for itself within 12 months against even the most affordable API, and within 5 months against a flagship.
+For teams running FP16 models up to 27B parameters where **privacy, cost control, or volume** matter, the R9700 dual-card configuration is a compelling option — and volume is the deciding lever. A team generating 5 million output tokens per month spends about $185/year on local inference (electricity + full hardware amortization) versus $300/year through Claude Haiku 4.5 or $1,500/year through Claude Opus 4.8; at that volume, the case for local is privacy and control more than payback. Scale to 50 million tokens per month — where the concurrency numbers above apply — and local inference runs about $360/year against $3,000/year for Haiku 4.5, $6,000/year for Gemini 2.5 Pro, and $15,000/year for Opus 4.8. At that utilization, the workstation pays for itself in roughly six months if it displaces flagship-API traffic, and within one to three years against the budget tiers.
 
 Teams needing larger VRAM pools (35B+ MoE models) should consider adding more R9700 cards or evaluating the 4-card B70 configuration.
 
 ---
 
-*Tested June 2026 on a Puget Systems workstation with 2× AMD Radeon AI PRO R9700 GPUs running Ubuntu 25.04. All LLM benchmarks used `vllm/vllm-openai-rocm:v0.20.2` with `--enforce-eager` and `NCCL_P2P_DISABLE=1`. Image generation used `rocm/pytorch:latest` with ComfyUI and Z-Image Turbo. GPU power measured via `sysfs hwmon` (`power1_average`). Cloud API pricing as of June 2026.*
+*Tested June 2026 on a Puget Systems workstation with 2× AMD Radeon AI PRO R9700 GPUs running Ubuntu 25.04. All LLM benchmarks used `vllm/vllm-openai-rocm:v0.20.2` with `--enforce-eager` and `NCCL_P2P_DISABLE=1`. Image generation used `rocm/pytorch:latest` with ComfyUI and Z-Image Turbo. GPU power measured via `sysfs hwmon` (`power1_average`). Cloud API pricing as of June 2026; GPU hardware pricing reflects Puget Systems configured-system pricing as of July 2026.*
 
