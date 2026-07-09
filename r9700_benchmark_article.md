@@ -144,7 +144,26 @@ The R9700's real value proposition emerges when two cards work together. With 64
 
 On our test system, vLLM's Tensor Parallelism (TP) mode triggers RCCL all-reduce failures on PCIe-connected RDNA 4 GPUs. This is a known issue with RCCL's collective operations on this new GPU architecture (no XGMI/NVLink equivalent exists on these cards, and the current RCCL releases shipping in ROCm vLLM images do not yet launch collectives reliably on gfx1201). In our follow-up investigation, even with full PCIe peer-to-peer verified working at the platform level, stock ROCm vLLM images still failed TP=2 — this is a software maturity gap in the RCCL/RDNA 4 stack, not a configuration problem. Pipeline Parallelism (PP=2) avoids collectives entirely by splitting model layers sequentially across GPUs rather than sharding each layer. The tradeoff: PP introduces "pipeline bubbles" (idle time between pipeline stages) that slightly reduce throughput compared to ideal TP scaling. The benefit: it works reliably with zero stability issues.
 
-Notably, TP=2 on dual R9700 is achievable today outside stock vLLM: the SGLang inference server, with community RDNA 4 patches, has a demonstrated same-hardware TP=2 concurrent-serving result (including AWQ int4 and FP8 support that ROCm vLLM currently lacks). We expect this gap to close as RCCL fixes land in released ROCm images; a follow-up article on SGLang and quantized serving is planned.
+Notably, the vLLM/RCCL limitation is not the end of the dual-GPU story on this hardware. llama.cpp's `--split-mode row` computes every token on both GPUs using HIP peer transfers — no RCCL collectives at all — and delivers tensor-parallel-style speedups today. We benchmarked it below. For teams that specifically want vLLM-style TP, the SGLang inference server with community RDNA 4 patches has a demonstrated same-hardware TP=2 concurrent-serving result (including AWQ int4 and FP8 support that ROCm vLLM currently lacks). We expect the RCCL gap to close as fixes land in released ROCm images.
+
+### The Faster Dual-GPU Path: llama.cpp Row Split
+
+While vLLM is limited to Pipeline Parallelism on this hardware, llama.cpp's ROCm backend offers a genuine both-GPUs-per-token mode. With `--split-mode row`, each layer's weights are split across both cards and every token's computation runs on both GPUs simultaneously — the same work distribution TP provides, implemented over direct HIP peer-to-peer copies instead of RCCL collectives.
+
+We benchmarked the current `llama.cpp:server-rocm` build with Qwen2.5-32B-Instruct at Q4_K_M quantization (a 32B model in roughly 20 GB, split across both cards), using the same GenAI-Perf methodology as the rest of this article:
+
+| Split mode | Concurrency | Aggregate tok/s | Per-user tok/s | ITL |
+|---|---|---:|---:|---:|
+| row | 1 | **23.0** | 23.0 | 44 ms |
+| row | 4 | 36.0 | 12.0 | 85 ms |
+| row | 8 | **60.0** | 9.8 | 102 ms |
+| layer | 1 | 23.4 | 23.4 | 43 ms |
+| layer | 4 | 40.2 | 11.4 | 89 ms |
+| layer | 8 | 49.5 | 7.7 | 130 ms |
+
+*Qwen2.5-32B-Instruct Q4_K_M, 500 input / 500 output tokens, streaming. Combined GPU power under row-split load: 453W average, 599W peak — both cards genuinely working. TTFT runs ~1s at concurrency 1 (32B prefill), higher than the smaller vLLM-served models elsewhere in this article. [†verify: rerun measured on our KVM-passthrough dev environment, validated within 3% of a bare-metal reference run — spot-check on bare metal before publication]*
+
+Two results stand out. First, **23 tok/s single-user on a 32B-class model — more than double the 10.9 tok/s our vLLM PP=2 setup achieves on the FP16 27B**. The comparison isn't strictly apples-to-apples (Q4 quantized 32B vs. unquantized FP16 27B; quantization itself accounts for much of the bandwidth savings), but for teams who are comfortable with 4-bit weights, this is the fastest way to run big models on a pair of R9700s today. Second, concurrency scaling is real: 60 tok/s aggregate at 8 users in row mode. Earlier llama.cpp builds crashed under concurrent row-split decode on RDNA 4; the current build ran our full concurrent sweep without a single failure. Layer split is the more conservative choice and trades a little top-end aggregate throughput (49.5 vs 60 tok/s at 8 users) for slightly better mid-range behavior.
 
 ### 8B Models: PP=2 vs. Single-GPU
 
@@ -372,7 +391,7 @@ The R9700 is approximately 8% faster at image generation, consistent with its ba
 
 Two issues required workarounds during testing:
 
-**RCCL Tensor Parallelism failures.** vLLM's Tensor Parallelism mode (TP=2) fails during the RCCL all-reduce collective operation on PCIe-connected RDNA 4 GPUs. This is a known ROCm issue, and our follow-up testing shows it is deeper than PCIe topology: even with platform-level GPU peer-to-peer enabled and verified, the RCCL collective kernels in current ROCm vLLM images do not launch on gfx1201. Setting `NCCL_P2P_DISABLE=1` alone is not sufficient to make TP work. The reliable fix in vLLM is Pipeline Parallelism (PP=2), which avoids collective ops entirely at the cost of 2.5–6.5% throughput. Teams that specifically need TP=2 (for example, for quantized int4/FP8 serving at high concurrency) should look at SGLang with RDNA 4 patches, which has demonstrated working TP=2 on this exact hardware. We expect AMD to address the RCCL gap as the ROCm stack matures for RDNA 4.
+**RCCL Tensor Parallelism failures in vLLM.** vLLM's Tensor Parallelism mode (TP=2) fails during the RCCL all-reduce collective operation on PCIe-connected RDNA 4 GPUs. This is a known ROCm issue, and our follow-up testing shows it is deeper than PCIe topology: even with platform-level GPU peer-to-peer enabled and verified, the RCCL collective kernels in current ROCm vLLM images do not launch on gfx1201. Setting `NCCL_P2P_DISABLE=1` alone is not sufficient to make TP work. Within vLLM, the reliable fix is Pipeline Parallelism (PP=2), which avoids collective ops entirely at the cost of 2.5–6.5% throughput. The practical workarounds outside vLLM: llama.cpp's row split (benchmarked above — both GPUs per token over HIP peer transfers, no RCCL involved), or SGLang with RDNA 4 patches for true TP=2 with int4/FP8 quantization. We expect AMD to address the RCCL gap as the ROCm stack matures for RDNA 4. It's worth noting how fast this stack is moving: llama.cpp builds from just weeks before this test crashed under concurrent row-split decode on RDNA 4, and the current build sailed through our full concurrent sweep.
 
 **Container permissions for /dev/kfd.** The `rocm/pytorch:latest` container requires `privileged: true` and `user: root` to access `/dev/kfd` (AMD's kernel fusion driver device node). Without these, `torch.cuda.is_available()` returns `False` even with device passthrough configured. This is a container configuration issue, not a hardware limitation.
 
@@ -431,6 +450,19 @@ When using multiple AMD RDNA 4 GPUs with stock vLLM, always use PP (Pipeline Par
 
 If your workload requires true TP=2 (quantized int4/FP8 models, maximum concurrent throughput), SGLang with RDNA 4 patches is currently the demonstrated path on this hardware.
 
+For quantized GGUF models, llama.cpp's row split is the simpler both-GPUs-per-token alternative — no RCCL, no special platform configuration:
+
+```bash
+# llama.cpp: both GPUs compute every token via HIP peer transfers
+docker run -d --device /dev/kfd --device /dev/dri \
+  --security-opt seccomp=unconfined --group-add video --group-add render \
+  -p 8000:8000 --entrypoint /app/llama-server \
+  ghcr.io/ggml-org/llama.cpp:server-rocm \
+  -hf bartowski/Qwen2.5-32B-Instruct-GGUF:Q4_K_M \
+  -ngl 99 --split-mode row -c 16384 --parallel 8 \
+  --host 0.0.0.0 --port 8000 --jinja
+```
+
 ### ComfyUI Docker Compose (Image Generation)
 
 ```yaml
@@ -454,6 +486,8 @@ The AMD Radeon AI PRO R9700 delivers genuine AI inference capability on RDNA 4 s
 - **8B models at excellent speeds:** DeepSeek R1 8B hits 61.3 tok/s on a single card — faster than any Intel B70 result at the same parameter scale. Qwen3 8B, a thinking/reasoning model, delivers 37.4 tok/s with the best concurrency scaling tested (192 tok/s at 8 users). Llama 3.1 8B delivers 31.9 tok/s. Qwen2.5 3B reaches 81.1 tok/s. All are production-usable for interactive chat.
 
 - **27B models that won't fit on a single card:** Qwen3.6-27B Dense runs at 10.9 tok/s with a 363 ms TTFT on two R9700 cards. Full FP16 precision, no quantization required, on roughly $3,800 of GPU hardware.
+
+- **A genuine both-GPUs-per-token path for quantized models:** llama.cpp's row split runs a 32B-class model at 23 tok/s single-user — more than double our vLLM PP=2 result on the FP16 27B — scaling to 60 tok/s aggregate at 8 concurrent users, with no RCCL dependency.
 
 - **Reliable image generation:** 1024×1024 images in 3.5 seconds steady-state via Z-Image Turbo, with zero failures across 10 runs.
 
@@ -487,5 +521,5 @@ Teams needing larger VRAM pools (35B+ MoE models) should consider adding more R9
 
 ---
 
-*Tested June 2026 on a Puget Systems workstation with 2× AMD Radeon AI PRO R9700 GPUs running Ubuntu 25.04. All LLM benchmarks used `vllm/vllm-openai-rocm:v0.20.2` with `--enforce-eager` and `NCCL_P2P_DISABLE=1`. Image generation used `rocm/pytorch:latest` with ComfyUI and Z-Image Turbo. GPU power measured via `sysfs hwmon` (`power1_average`). Cloud API pricing as of June 2026; GPU hardware pricing reflects Puget Systems configured-system pricing as of July 2026.*
+*Tested June 2026 on a Puget Systems workstation with 2× AMD Radeon AI PRO R9700 GPUs running Ubuntu 25.04. All LLM benchmarks used `vllm/vllm-openai-rocm:v0.20.2` with `--enforce-eager` and `NCCL_P2P_DISABLE=1`. llama.cpp benchmarks used `ghcr.io/ggml-org/llama.cpp:server-rocm` (July 2026 build). Image generation used `rocm/pytorch:latest` with ComfyUI and Z-Image Turbo. GPU power measured via `sysfs hwmon` (`power1_average`). Cloud API pricing as of June 2026; GPU hardware pricing reflects Puget Systems configured-system pricing as of July 2026.*
 
