@@ -29,6 +29,7 @@ NC='\033[0m'
 # Constants
 # ============================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION="1.6.0"
 APP_PACK_REPO="https://github.com/Puget-Systems/puget-docker-app-packs.git"
 APP_PACK_BRANCH="main"
 # Lab cache host (DGX Spark): Olah HF mirror on :8090, Squid HTTP proxy on :3128
@@ -125,8 +126,9 @@ while [[ "$#" -gt 0 ]]; do
         --max-model-len) MAX_MODEL_LEN="$2"; shift ;;
         --resume) RESUME_DIR="$2"; shift ;;
         --skip-driver-check) SKIP_DRIVER_CHECK=true ;;
+        -v|--version) echo "run_benchmarks.sh — Puget AI App Pack bench v${VERSION}"; exit 0 ;;
         -h|--help)
-            echo -e "${BLUE}Puget Systems AI App Pack — Automated Benchmark Suite${NC}"
+            echo -e "${BLUE}Puget Systems AI App Pack — Automated Benchmark Suite v${VERSION}${NC}"
             echo ""
             echo "Usage:"
             echo "  ./run_benchmarks.sh                                  On-box mode — run on THIS machine (interactive)"
@@ -152,6 +154,7 @@ while [[ "$#" -gt 0 ]]; do
             echo "  --fresh-cache        Clear model caches before running (default: keep cached models)"
             echo "  --resume DIR         Skip (pack, model) entries already completed in a prior results dir"
             echo "  --skip-driver-check  Bypass the host-driver vs container-CUDA compatibility gate"
+            echo "  -v, --version        Print the bench suite version and exit"
             exit 0
             ;;
         *) echo -e "${RED}Unknown parameter: $1. Use --help for usage.${NC}"; exit 1 ;;
@@ -342,6 +345,7 @@ run_doctor() {
     echo -e "${BLUE}==============================================================${NC}"
     echo -e "${BLUE}   Puget Systems AI Benchmark — Doctor (readiness check)${NC}"
     echo -e "${BLUE}==============================================================${NC}"
+    echo -e "  Version: v${VERSION}"
     if [ "$LOCAL_MODE" = true ]; then
         echo -e "  Mode: ${GREEN}on-box${NC} (this machine)"
     else

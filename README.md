@@ -309,7 +309,7 @@ MIT — See [LICENSE](LICENSE)
 
 ## Changelog
 
-### v1.6.0
+### v1.6.0 — 2026-07-10
 
 - **Driver ↔ model compatibility gate** — each model's container image carries a minimum NVIDIA driver (cu130 → ≥580, stable → ≥570, defined once in the app-pack's `min_driver_for_image()`). The bench checks the installed driver *before* launching and SKIPs incompatible models with a plain-language fix; `--doctor` reports which image lines the driver supports. Override with `--skip-driver-check`.
 - **Model manifest is the single source of truth** — the bench consumes the app-pack's new `scripts/list_models.sh` (versioned TSV: pack, engine, menu #, model id, size, min driver, image). The three divergent hardcoded Ollama lists are gone; interactive Ollama menus come live from the app-pack like vLLM already did. Old app-pack branches without the manifest fall back to live menu enumeration.
@@ -319,6 +319,12 @@ MIT — See [LICENSE](LICENSE)
 - **Cache misses are loud** — if the lab cache is unreachable, an interactive run now asks before pulling 40–120 GB direct (non-interactive runs keep the old fall-through).
 - **Temp-dir cleanup re-enabled** — per-run temp trees (pack copies, scratch) are removed on exit; model weights persist in shared volumes / the model cache as before.
 - **One-offs archived** — `run_spark_*.sh` moved to `archive/`; `run_benchmarks.sh` remains the single entry point.
+- **`--version` / `-v`** — the bench now reports its own version (also shown in `--help` and the `--doctor` header).
+- **Interactive `Run ALL` no longer hangs** — the Custom model menu entry was silently blocking on `read` during matrix enumeration; it's now skipped with stdin redirected to `/dev/null`.
+- **Docker Compose detection** — auto-detects the v2 plugin vs the legacy `docker-compose` binary and fails early with a clear message if neither is present.
+- **Intel XPU device passthrough** — `team_llm` and `comfy_ui` containers now receive the correct `/dev/dri` devices on Intel Arc boxes.
+- **Resolved model IDs everywhere** — `team_llm` shows the actual model ID (not the menu number) in the matrix preview, results dirs, and `--resume` keys.
+- **Failure diagnosis expanded** — the load monitor knows each model's size, and the classifier now recognizes Intel GPU-loss and multi-GPU TP engine-core init failures (`shm_broadcast cancelled`).
 
 ### v1.5.0
 
