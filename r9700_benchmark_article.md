@@ -142,9 +142,11 @@ The R9700's real value proposition emerges when two cards work together. With 64
 
 ### Why Pipeline Parallelism?
 
-On our test system, vLLM's Tensor Parallelism (TP) mode triggers RCCL all-reduce failures on PCIe-connected RDNA 4 GPUs. This is a known issue with RCCL's collective operations on this new GPU architecture (no XGMI/NVLink equivalent exists on these cards, and the current RCCL releases shipping in ROCm vLLM images do not yet launch collectives reliably on gfx1201). In our follow-up investigation, even with full PCIe peer-to-peer verified working at the platform level, stock ROCm vLLM images still failed TP=2 — this is a software maturity gap in the RCCL/RDNA 4 stack, not a configuration problem. Pipeline Parallelism (PP=2) avoids collectives entirely by splitting model layers sequentially across GPUs rather than sharding each layer. The tradeoff: PP introduces "pipeline bubbles" (idle time between pipeline stages) that slightly reduce throughput compared to ideal TP scaling. The benefit: it works reliably with zero stability issues.
+On our test system, vLLM's Tensor Parallelism (TP) mode triggers RCCL all-reduce failures on PCIe-connected RDNA 4 GPUs. This is a known issue with RCCL's collective operations on this new GPU architecture (no XGMI/NVLink equivalent exists on these cards, and the current RCCL releases shipping in ROCm vLLM images do not yet launch collectives reliably on gfx1201). In our follow-up investigation, even with full PCIe peer-to-peer verified working at the platform level, stock ROCm vLLM images still failed TP=2. This is a software maturity gap in the RCCL/RDNA 4 stack (tracked in [vLLM issue #40980](https://github.com/vllm-project/vllm/issues/40980) and [ROCm rocm-systems #5480](https://github.com/ROCm/rocm-systems/issues/5480)), not a configuration problem. Pipeline Parallelism (PP=2) avoids collectives entirely by splitting model layers sequentially across GPUs rather than sharding each layer. The tradeoff: PP introduces "pipeline bubbles" (idle time between pipeline stages) that slightly reduce throughput compared to ideal TP scaling. The benefit: it works reliably with zero stability issues.
 
-Notably, the vLLM/RCCL limitation is not the end of the dual-GPU story on this hardware. llama.cpp distributes multi-GPU work over direct HIP transfers — no RCCL collectives at all — and paired with 4-bit GGUF quantization it more than doubles our 27B throughput; we benchmark it after the PP=2 results below. For teams that specifically want vLLM-style TP, the SGLang inference server with community RDNA 4 patches has a demonstrated same-hardware TP=2 concurrent-serving result (including AWQ int4 and FP8 support that ROCm vLLM currently lacks). We expect the RCCL gap to close as fixes land in released ROCm images.
+Notably, the vLLM/RCCL limitation is not the end of the dual-GPU story on this hardware. llama.cpp distributes multi-GPU work over direct HIP transfers, with no RCCL collectives involved, and paired with 4-bit GGUF quantization it more than doubles our 27B throughput; we benchmark it after the PP=2 results below. For teams that specifically want vLLM-style TP, the SGLang inference server with community RDNA 4 patches has a demonstrated same-hardware TP=2 concurrent-serving result (including AWQ int4 and FP8 support that ROCm vLLM currently lacks). We expect the RCCL gap to close as fixes land in released ROCm images.
+
+![How the three multi-GPU execution modes distribute work across two R9700 GPUs: vLLM Pipeline Parallelism, llama.cpp layer split, and llama.cpp row split](images/r9700_multi_gpu_modes.svg)
 
 ### 8B Models: PP=2 vs. Single-GPU
 
@@ -175,7 +177,7 @@ The Qwen3.6-27B is a 27 billion parameter dense model requiring approximately 54
 
 *² Output tokens reduced to 200 and measurement interval extended to 120s to accommodate the model's reasoning overhead within the genai-perf measurement window.*
 
-At 10.9 tok/s for a single user, this is approximately 650 words per minute of generated text - fast enough for interactive use, though noticeably slower than the 8B-class models. The 363 ms TTFT means the model begins responding in under half a second, which is excellent for a model of this size.
+At 10.9 tok/s for a single user, output arrives at roughly 490 words per minute - above comfortable reading speed, so the experience is usable, but this is not a headline number. The B70's four-card configuration runs the same model faster (13.1 tok/s), and as a reasoning model the 27B spends its first seconds thinking before visible output appears. What this result establishes is capability: the full-precision 27B tier runs at all on a two-card R9700 workstation, with a 363 ms TTFT that means the model starts working on a response in under half a second.
 
 The 91 ms ITL translates to approximately 11 tokens arriving per second from the user's perspective. While this is slower than the 8B models' 16–31 ms ITL, it is still smooth enough that output appears as a continuous stream rather than choppy bursts.
 
@@ -193,11 +195,11 @@ The 10.9 tok/s above is the FP16 ceiling with vLLM's Pipeline Parallelism. There
 | 4 | **55.7** | 884 | 64 | 13.5s | 17.7s |
 | 8 | **56.0** | 2,668 | 126 | 27.6s | 30.5s |
 
-*Benchmark: 500 input tokens, 200 output tokens, Q4_K_M GGUF (`bartowski/Qwen_Qwen3.6-27B-GGUF`), `--split-mode layer` across 2× R9700, 16384 context, 120-second measurement interval — matching the FP16/PP=2 configuration above. [†verify: llama.cpp runs measured on our AMD development environment (2× R9700 passed through to a KVM guest with PCIe P2P enabled); spot-check on the bare-metal workstation before publication.]*
+*Benchmark: 500 input tokens, 200 output tokens, Q4_K_M GGUF (`bartowski/Qwen_Qwen3.6-27B-GGUF`), `--split-mode layer` across 2× R9700, 16384 context, 120-second measurement interval, matching the FP16/PP=2 configuration above. [†verify: llama.cpp runs measured on our AMD development environment (2× R9700 passed through to a KVM guest with PCIe P2P enabled); spot-check on the bare-metal workstation before publication.]*
 
-The result: **the same Qwen3.6-27B at 23.4 tok/s single-user — 2.1× the FP16/PP=2 throughput — with a comparable TTFT (382 vs. 363 ms) and less than half the ITL (41 vs. 91 ms)**. The gain comes from quantization: Q4 weights are roughly a quarter the size of FP16, and since single-stream decode is memory-bandwidth-bound, reading less per token directly translates to speed. The tradeoff is 4-bit precision instead of FP16. Under concurrent load it scales to 55.7 tok/s at 4 users and plateaus around 56 tok/s at 8, where TTFT climbs to ~2.7s.
+The result: **the same Qwen3.6-27B at 23.4 tok/s single-user, 2.1× the FP16/PP=2 throughput, with a comparable TTFT (382 vs. 363 ms) and less than half the ITL (41 vs. 91 ms)**. For most deployments this is the configuration we would actually choose; FP16 remains the option when precision requirements rule out quantization. The gain comes from quantization: Q4 weights are roughly a quarter the size of FP16, and since single-stream decode is memory-bandwidth-bound, reading less per token directly translates to speed. The tradeoff is 4-bit precision instead of FP16. Under concurrent load it scales to 55.7 tok/s at 4 users and plateaus around 56 tok/s at 8, where TTFT climbs to ~2.7s.
 
-Two honest footnotes. At Q4_K_M the 27B weighs only ~17 GB, so it technically fits a single R9700 — splitting it across both cards is what buys the KV-cache headroom for the concurrent results above. And llama.cpp offers a second multi-GPU mode, `--split-mode row`, which computes every token on both GPUs tensor-parallel-style: on Qwen2.5-32B Q4_K_M it reached 23.0 tok/s single-user and 60 tok/s at 8 concurrent users, but on Qwen3.6-27B it aborts under concurrent decode (see [What Doesn't Work](#what-doesnt-work)), so we report the crash-safe layer split here.
+Two honest footnotes. At Q4_K_M the 27B weighs only ~17 GB, so it technically fits a single R9700; splitting it across both cards is what buys the KV-cache headroom for the concurrent results above. And llama.cpp offers a second multi-GPU mode, `--split-mode row`, which computes every token on both GPUs tensor-parallel-style: on Qwen2.5-32B Q4_K_M it reached 23.0 tok/s single-user and 60 tok/s at 8 concurrent users, but on Qwen3.6-27B it aborts under concurrent decode (see [What Doesn't Work](#what-doesnt-work)), so we report the crash-safe layer split here.
 
 ---
 
@@ -217,7 +219,7 @@ The results tell a clear story across two tiers:
 
 1. **8B models and smaller** run best on a single R9700. The PP=2 overhead (2.5–6.5%) makes dual-GPU sharding counterproductive for models that already fit in 32 GB. DeepSeek R1 8B is the standout performer at 61.3 tok/s, followed by Qwen3 8B at 37.4 tok/s and Llama 3.1 8B at 31.9 tok/s. Notably, Qwen3 8B - a thinking/reasoning model - delivers excellent throughput with the best concurrency scaling of any model tested (5.1× at 8 users).
 
-2. **27B dense models** require dual-GPU. The Qwen3.6-27B runs at 10.9 tok/s with a 363 ms TTFT - usable for interactive chat and production inference. This model class is inaccessible on any single 32 GB card without quantization.
+2. **27B dense models** require dual-GPU at full FP16 precision. The Qwen3.6-27B runs at 10.9 tok/s with a 363 ms TTFT - usable for interactive chat and production inference. This model class is inaccessible on any single 32 GB card without quantization.
 
 ---
 
@@ -253,7 +255,7 @@ Using $0.12/kWh (US average) and estimated total system power (GPU average + 300
 
 *Cloud pricing as of June 2026: GPT-5.5 ($30/1M output), Claude Opus 4.8 ($25/1M output), Gemini 3.1 Pro ($12/1M output). Local costs are electricity only.*
 
-Even the most expensive local configuration - the 27B model on two GPUs - costs $1.91 per million output tokens, roughly **6× cheaper than the least expensive frontier API in our comparison** (Gemini 3.1 Pro at $12/1M). The 8B models range from $0.21–$0.50 per million tokens, making them **24–143× cheaper** than cloud APIs depending on which model you compare against.
+Even the most expensive local configuration - the 27B model on two GPUs - costs $1.91 per million output tokens, **6.3× cheaper than the least expensive frontier API in our comparison** (Gemini 3.1 Pro at $12/1M). The 8B models range from $0.21–$0.50 per million tokens, making them **24–143× cheaper** than cloud APIs depending on which model you compare against.
 
 ### Multi-User Economics
 
@@ -327,7 +329,7 @@ These are three consecutive runs from the same prompt and settings - not cherry-
 
 Both the R9700 and the Arc Pro B70 target the same market - professional AI inference at 32 GB per card - but come from different architectural families with different tradeoffs. We tested both cards on equivalent workloads using our benchmark framework, allowing direct comparison.
 
-> **Methodology note:** The B70 benchmarks used a custom test harness with multiple test types (Short Prompts, Medium Generation, Long Generation, Concurrent). The R9700 benchmarks used NVIDIA GenAI-Perf with a consistent 500-input/500-output token configuration across all tests. Both measure the same fundamental metric - decode throughput in tok/s at comparable output lengths - but the tooling differs. The numbers below compare equivalent test configurations (single-user, long generation) from each framework.
+> **Methodology note:** Both articles use the identical benchmark methodology: NVIDIA GenAI-Perf with `--streaming`, 500 input / 500 output tokens, 50 prompts, at concurrency 1, 4, and 8. The numbers below are directly comparable.
 
 ### Hardware Comparison
 
@@ -348,29 +350,30 @@ Both the R9700 and the Arc Pro B70 target the same market - professional AI infe
 
 | Model | R9700 (tok/s) | B70 (tok/s) | R9700 Advantage |
 |-------|---------------|-------------|-----------------|
-| Qwen2.5 3B | **81.1** | 76.2 | +6.4% |
-| Llama 3.1 8B | 31.9 | 36.1 | −11.6% |
-| DeepSeek R1 8B | **61.3** | 36.1 | +69.8% |
+| Qwen2.5 3B | **81.1** | 72.9 | +11.2% |
+| Qwen3 8B (thinking) | **37.4** | 34.7 | +7.8% |
+| Llama 3.1 8B | 31.9 | **35.4** | −9.9% |
+| DeepSeek R1 8B | 61.3 | **66.9** | −8.4% |
 
 The comparison is more nuanced than a simple speed ranking:
 
-- **Qwen2.5 3B:** The R9700 is ~6% faster, consistent with its higher memory bandwidth (640 vs. 608 GB/s). Both cards are "fast enough" at this model size — over 75 tok/s is well beyond interactive requirements.
+- **Qwen2.5 3B and Qwen3 8B:** The R9700 is 8–11% faster, consistent with its higher memory bandwidth (640 vs. 608 GB/s). Both cards are "fast enough" at the 3B size — over 70 tok/s is well beyond interactive requirements.
 
-- **Llama 3.1 8B:** The B70 is ~12% faster here. This may reflect better XPU kernel optimization for the Llama architecture in Intel's vLLM fork, or differences in how vLLM schedules work across the two backends.
+- **Llama 3.1 8B and DeepSeek R1 8B:** The B70 is 8–10% faster on both. Intel's LLM Scaler container has improved rapidly — earlier builds of the Intel stack measured roughly half this DeepSeek throughput on the same card — and the current release extracts real performance from the Llama-family architectures.
 
-- **DeepSeek R1 8B:** The R9700 dramatically outperforms the B70, delivering 61.3 vs. 36.1 tok/s — a **70% advantage**. This model appears to benefit significantly from the R9700's higher compute throughput and memory bandwidth. DeepSeek's architecture may also map more efficiently to AMD's compute unit layout.
+- **The honest summary:** single-card performance is a wash, trading blows within ~10% depending on the model. Neither card holds a decisive per-card speed advantage at this tier; the differences that matter are in multi-GPU topology, power, and price, covered below.
 
 ### Multi-GPU: 27B Dense Model
 
 | | R9700 (PP=2, 2 cards) | B70 (TP=4, 4 cards) |
 |---|---|---|
-| **Throughput** | 10.9 tok/s | 13.2 tok/s |
-| **TTFT** | 363 ms | — (not measured) |
-| **ITL** | 91 ms | — |
+| **Throughput** | 10.9 tok/s | 13.1 tok/s |
+| **TTFT** | 363 ms | 265 ms |
+| **ITL** | 91 ms | 76 ms |
 | **Total GPU Cost (configured, July 2026)** | ~$3,760 (2 cards) | ~$4,450 (4 cards) |
-| **Throughput per $1K GPU** | 2.90 tok/s | 2.97 tok/s |
+| **Throughput per $1K GPU** | 2.90 tok/s | 2.94 tok/s |
 
-The B70 4-card configuration delivers 21% higher raw throughput (13.2 vs. 10.9 tok/s) for about 18% more GPU cost — on a throughput-per-dollar basis, the two configurations are effectively tied (within ~2%). The meaningful differences are elsewhere: the R9700 gets there with half the cards (two PCIe slots instead of four, 600W of GPU TBP instead of 920W), while the B70 configuration brings twice the aggregate VRAM.
+The B70 4-card configuration delivers 20% higher raw throughput (13.1 vs. 10.9 tok/s) for about 18% more GPU cost, so on a throughput-per-dollar basis the two configurations are effectively tied. The meaningful differences are elsewhere: the R9700 gets there with half the cards and half the slots, on a 600W combined GPU power budget (2×300W) versus the B70's 920W (4×230W), while the B70 configuration brings twice the aggregate VRAM.
 
 However, the B70's 4-card configuration offers 128 GB of total VRAM - enough for 35B MoE models and beyond - while the R9700 2-card setup is capped at 64 GB. Teams that need to run models larger than 27B FP16 will need either more R9700 cards or the B70's larger aggregate pool.
 
@@ -390,9 +393,9 @@ The R9700 is approximately 8% faster at image generation, consistent with its ba
 
 Three issues required workarounds during testing:
 
-**RCCL Tensor Parallelism failures in vLLM.** vLLM's Tensor Parallelism mode (TP=2) fails during the RCCL all-reduce collective operation on PCIe-connected RDNA 4 GPUs. This is a known ROCm issue, and our follow-up testing shows it is deeper than PCIe topology: even with platform-level GPU peer-to-peer enabled and verified, the RCCL collective kernels in current ROCm vLLM images do not launch on gfx1201. Setting `NCCL_P2P_DISABLE=1` alone is not sufficient to make TP work. Within vLLM, the reliable fix is Pipeline Parallelism (PP=2), which avoids collective ops entirely at the cost of 2.5–6.5% throughput. The practical workarounds outside vLLM: llama.cpp (benchmarked above — multi-GPU over direct HIP transfers, no RCCL involved), or SGLang with RDNA 4 patches for true TP=2 with int4/FP8 quantization. We expect AMD to address the RCCL gap as the ROCm stack matures for RDNA 4.
+**RCCL Tensor Parallelism failures in vLLM.** vLLM's Tensor Parallelism mode (TP=2) fails during the RCCL all-reduce collective operation on PCIe-connected RDNA 4 GPUs. This is a known ROCm issue, and our follow-up testing shows it is deeper than PCIe topology: even with platform-level GPU peer-to-peer enabled and verified, the RCCL collective kernels in current ROCm vLLM images do not launch on gfx1201. Setting `NCCL_P2P_DISABLE=1` alone is not sufficient to make TP work. Within vLLM, the reliable fix is Pipeline Parallelism (PP=2), which avoids collective ops entirely at the cost of 2.5–6.5% throughput. The practical workarounds outside vLLM: llama.cpp (benchmarked above; multi-GPU over direct HIP transfers with no RCCL involved), or SGLang with RDNA 4 patches for true TP=2 with int4/FP8 quantization. We expect AMD to address the RCCL gap as the ROCm stack matures for RDNA 4.
 
-**llama.cpp row split is architecture-dependent.** `--split-mode row` ran our full concurrent sweep on Qwen2.5-32B without a single failure, but on Qwen3.6-27B the server aborts under concurrent decode with `GGML_ASSERT(!(split && ne02 < ne12))` — the row-split matmul path does not yet support the broadcast shapes Qwen3.6's architecture produces in batched decode. Until that is addressed upstream, use `--split-mode layer` for Qwen3.6-class models (it is what we benchmarked above) and treat row mode as per-architecture: verify it on your model before deploying. We also saw row-split instability under concurrency in earlier testing on a platform without GPU peer-to-peer enabled — if you hit crashes, layer split is the conservative choice.
+**llama.cpp row split is architecture-dependent.** `--split-mode row` ran our full concurrent sweep on Qwen2.5-32B without a single failure, but on Qwen3.6-27B the server aborts under concurrent decode with `GGML_ASSERT(!(split && ne02 < ne12))`: the row-split matrix-multiplication path does not yet support the broadcast shapes Qwen3.6's architecture produces in batched decode. Until that is addressed upstream, use `--split-mode layer` for Qwen3.6-class models (it is what we benchmarked above) and treat row mode as per-architecture: verify it on your model before deploying. We also saw row-split instability under concurrency in earlier testing on a platform without GPU peer-to-peer enabled. If you hit crashes, layer split is the conservative choice.
 
 **Container permissions for /dev/kfd.** The `rocm/pytorch:latest` container requires `privileged: true` and `user: root` to access `/dev/kfd` (AMD's kernel fusion driver device node). Without these, `torch.cuda.is_available()` returns `False` even with device passthrough configured. This is a container configuration issue, not a hardware limitation.
 
@@ -402,9 +405,9 @@ Three issues required workarounds during testing:
 
 The AMD Radeon AI PRO R9700 delivers genuine AI inference capability on RDNA 4 silicon - and the economics make a strong case for local deployment:
 
-- **8B models at excellent speeds:** DeepSeek R1 8B hits 61.3 tok/s on a single card — faster than any Intel B70 result at the same parameter scale. Qwen3 8B, a thinking/reasoning model, delivers 37.4 tok/s with the best concurrency scaling tested (192 tok/s at 8 users). Llama 3.1 8B delivers 31.9 tok/s. Qwen2.5 3B reaches 81.1 tok/s. All are production-usable for interactive chat.
+- **8B models at production-usable speeds:** DeepSeek R1 8B hits 61.3 tok/s on a single card. Qwen3 8B, a thinking/reasoning model, delivers 37.4 tok/s with the best concurrency scaling tested (192 tok/s at 8 users). Llama 3.1 8B delivers 31.9 tok/s, and Qwen2.5 3B reaches 81.1 tok/s. Single-card performance trades blows with the Arc Pro B70 within about 10% depending on the model.
 
-- **27B models that won't fit on a single card:** Qwen3.6-27B Dense runs at 10.9 tok/s with a 363 ms TTFT on two R9700 cards. Full FP16 precision, no quantization required, on roughly $3,800 of GPU hardware.
+- **The full-precision 27B tier is within reach:** Qwen3.6-27B Dense runs at 10.9 tok/s with a 363 ms TTFT on two R9700 cards in full FP16, no quantization required, on roughly $3,800 of GPU hardware. This is a capability result more than a speed result; the quantized path below is the practical deployment choice.
 
 - **The same 27B, twice as fast with quantization:** llama.cpp serves Qwen3.6-27B at Q4_K_M at 23.4 tok/s single-user — 2.1× our FP16/PP=2 result on the identical model — scaling to 56 tok/s aggregate at 8 concurrent users, with no RCCL dependency.
 
@@ -425,8 +428,8 @@ Here is how the three cards compare side by side:
 | **TBP** | 300W | 230W | 575W |
 | **Price per card (configured, July 2026)** | ~$1,880 | ~$1,110 | ~$4,130 |
 | **Tested Config VRAM** | 64 GB (2 cards, ~$3,760) | 128 GB (4 cards, ~$4,450) | 64 GB (2 cards, ~$8,260) |
-| **8B FP16 tok/s (single card)** | 61.3 (DeepSeek R1) | 36.1 | ~140–200 |
-| **27B FP16 tok/s** | 10.9 (PP=2, 2 cards) | 13.2 (TP=4, 4 cards) | N/A (single), not tested (multi) |
+| **8B FP16 tok/s (single card)** | 61.3 (DeepSeek R1) | 66.9 (DeepSeek R1) | ~140–200 |
+| **27B FP16 tok/s** | 10.9 (PP=2, 2 cards) | 13.1 (TP=4, 4 cards) | N/A (single), not tested (multi) |
 | **$/1M tokens (8B, electricity)** | $0.30 | Not measured | Not measured |
 | **Multi-GPU Method** | Pipeline Parallelism | Tensor Parallelism | Tensor Parallelism |
 
@@ -434,7 +437,7 @@ The RTX 5090 is roughly 4–5× faster per GPU on decode-bound workloads, driven
 
 The caveats are real but manageable: Tensor Parallelism failures in stock vLLM require using Pipeline Parallelism instead (a minor throughput penalty), and container permissions need explicit configuration. Once configured, the system ran with zero crashes or stability issues across our complete benchmark suite.
 
-For teams running FP16 models up to 27B parameters where **privacy, cost control, or volume** matter, the R9700 dual-card configuration is a compelling option — and volume is the deciding lever. A team generating 5 million output tokens per month spends about $185/year on local inference (electricity + full hardware amortization) versus $720/year through Gemini 3.1 Pro or $1,800/year through GPT-5.5; at that volume, the case for local is privacy and control more than payback. Scale to 50 million tokens per month — where the concurrency numbers above apply — and local inference runs about $360/year against $7,200/year for Gemini 3.1 Pro, $15,000/year for Claude Opus 4.8, and $18,000/year for GPT-5.5. At that utilization, the workstation pays for itself in roughly five months if it displaces flagship-API traffic, and in just over a year against the most affordable frontier tier.
+For teams running FP16 models up to 27B parameters where **privacy, cost control, or volume** matter, the R9700 dual-card configuration is a compelling option, and volume is the deciding lever. A team generating 5 million output tokens per month spends about $185/year on local inference (electricity + full hardware amortization) versus $720/year through Gemini 3.1 Pro or $1,800/year through GPT-5.5; at that volume, the case for local is privacy and control more than payback. Scale to 50 million tokens per month, where the concurrency numbers above apply, and local inference runs about $360/year against $7,200/year for Gemini 3.1 Pro, $15,000/year for Claude Opus 4.8, and $18,000/year for GPT-5.5. At that utilization, the workstation pays for itself in roughly five months if it displaces flagship-API traffic, and in just over a year against the most affordable frontier tier.
 
 Teams needing larger VRAM pools (35B+ MoE models) should consider adding more R9700 cards or evaluating the 4-card B70 configuration.
 
@@ -493,7 +496,7 @@ When using multiple AMD RDNA 4 GPUs with stock vLLM, always use PP (Pipeline Par
 
 If your workload requires true TP=2 (quantized int4/FP8 models, maximum concurrent throughput), SGLang with RDNA 4 patches is currently the demonstrated path on this hardware.
 
-For quantized GGUF models, llama.cpp is the simpler multi-GPU alternative — no RCCL, no special platform configuration:
+For quantized GGUF models, llama.cpp is the simpler multi-GPU alternative, with no RCCL and no special platform configuration:
 
 ```bash
 # llama.cpp: multi-GPU over direct HIP transfers (layer split)
@@ -506,7 +509,7 @@ docker run -d --device /dev/kfd --device /dev/dri \
   --host 0.0.0.0 --port 8000 --jinja
 ```
 
-`--split-mode row` (both GPUs per token) is faster at high concurrency on architectures that support it — verify against your model first (see What Doesn't Work).
+`--split-mode row` (both GPUs per token) is faster at high concurrency on architectures that support it; verify against your model first (see What Doesn't Work).
 
 ### ComfyUI Docker Compose (Image Generation)
 

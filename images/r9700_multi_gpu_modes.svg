@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#444"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#c0392b"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="560" fill="#ffffff"/>
+  <text x="600" y="36" text-anchor="middle" font-size="24" font-weight="bold" fill="#1a1a1a">Multi-GPU Execution Modes on 2× Radeon AI PRO R9700</text>
+
+  <!-- ============ Panel 1: vLLM Pipeline Parallelism ============ -->
+  <g transform="translate(20,70)">
+    <rect x="0" y="0" width="370" height="430" rx="10" fill="#f7f9fb" stroke="#c9d4de"/>
+    <text x="185" y="34" text-anchor="middle" font-size="18" font-weight="bold" fill="#1a1a1a">vLLM: Pipeline Parallelism (PP=2)</text>
+    <text x="185" y="56" text-anchor="middle" font-size="13" fill="#555">One GPU works on a token at a time</text>
+
+    <!-- GPU 0 -->
+    <rect x="45" y="85" width="280" height="120" rx="8" fill="#e8f0e8" stroke="#5b8c5a" stroke-width="2"/>
+    <text x="185" y="108" text-anchor="middle" font-size="14" font-weight="bold" fill="#2d5c2b">GPU 0</text>
+    <rect x="65" y="120" width="240" height="60" rx="5" fill="#ffffff" stroke="#5b8c5a"/>
+    <text x="185" y="147" text-anchor="middle" font-size="13" fill="#333">Layers 1–30</text>
+    <text x="185" y="167" text-anchor="middle" font-size="12" fill="#777">(full width of each layer)</text>
+
+    <!-- arrow between -->
+    <line x1="185" y1="205" x2="185" y2="245" stroke="#444" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <text x="200" y="230" font-size="12" fill="#555">activations hand off once per token</text>
+
+    <!-- GPU 1 -->
+    <rect x="45" y="250" width="280" height="120" rx="8" fill="#fdf1e7" stroke="#c77b3d" stroke-width="2"/>
+    <text x="185" y="273" text-anchor="middle" font-size="14" font-weight="bold" fill="#8a4d1a">GPU 1</text>
+    <rect x="65" y="285" width="240" height="60" rx="5" fill="#ffffff" stroke="#c77b3d"/>
+    <text x="185" y="312" text-anchor="middle" font-size="13" fill="#333">Layers 31–60</text>
+    <text x="185" y="332" text-anchor="middle" font-size="12" fill="#777">(full width of each layer)</text>
+
+    <text x="185" y="398" text-anchor="middle" font-size="12.5" fill="#333">✓ No collectives, works everywhere</text>
+    <text x="185" y="418" text-anchor="middle" font-size="12.5" fill="#666">"Pipeline bubbles" leave one GPU idle</text>
+  </g>
+
+  <!-- ============ Panel 2: llama.cpp layer split ============ -->
+  <g transform="translate(415,70)">
+    <rect x="0" y="0" width="370" height="430" rx="10" fill="#f7f9fb" stroke="#c9d4de"/>
+    <text x="185" y="34" text-anchor="middle" font-size="18" font-weight="bold" fill="#1a1a1a">llama.cpp: Layer Split</text>
+    <text x="185" y="56" text-anchor="middle" font-size="13" fill="#555">Layers assigned per GPU, direct HIP hand-off</text>
+
+    <rect x="45" y="85" width="280" height="120" rx="8" fill="#e8f0e8" stroke="#5b8c5a" stroke-width="2"/>
+    <text x="185" y="108" text-anchor="middle" font-size="14" font-weight="bold" fill="#2d5c2b">GPU 0</text>
+    <rect x="65" y="120" width="240" height="60" rx="5" fill="#ffffff" stroke="#5b8c5a"/>
+    <text x="185" y="147" text-anchor="middle" font-size="13" fill="#333">Layers 1–30 + KV cache</text>
+    <text x="185" y="167" text-anchor="middle" font-size="12" fill="#777">weights and cache stay local</text>
+
+    <line x1="185" y1="205" x2="185" y2="245" stroke="#444" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <text x="200" y="230" font-size="12" fill="#555">HIP transfer (no RCCL)</text>
+
+    <rect x="45" y="250" width="280" height="120" rx="8" fill="#fdf1e7" stroke="#c77b3d" stroke-width="2"/>
+    <text x="185" y="273" text-anchor="middle" font-size="14" font-weight="bold" fill="#8a4d1a">GPU 1</text>
+    <rect x="65" y="285" width="240" height="60" rx="5" fill="#ffffff" stroke="#c77b3d"/>
+    <text x="185" y="312" text-anchor="middle" font-size="13" fill="#333">Layers 31–60 + KV cache</text>
+    <text x="185" y="332" text-anchor="middle" font-size="12" fill="#777">weights and cache stay local</text>
+
+    <text x="185" y="398" text-anchor="middle" font-size="12.5" fill="#333">✓ Crash-safe on every model we tested</text>
+    <text x="185" y="418" text-anchor="middle" font-size="12.5" fill="#333">✓ 23.4 tok/s on Qwen3.6-27B Q4</text>
+  </g>
+
+  <!-- ============ Panel 3: llama.cpp row split ============ -->
+  <g transform="translate(810,70)">
+    <rect x="0" y="0" width="370" height="430" rx="10" fill="#f7f9fb" stroke="#c9d4de"/>
+    <text x="185" y="34" text-anchor="middle" font-size="18" font-weight="bold" fill="#1a1a1a">llama.cpp: Row Split</text>
+    <text x="185" y="56" text-anchor="middle" font-size="13" fill="#555">Both GPUs compute every token together</text>
+
+    <!-- side by side GPUs -->
+    <rect x="35" y="85" width="140" height="230" rx="8" fill="#e8f0e8" stroke="#5b8c5a" stroke-width="2"/>
+    <text x="105" y="108" text-anchor="middle" font-size="14" font-weight="bold" fill="#2d5c2b">GPU 0</text>
+    <rect x="50" y="122" width="110" height="80" rx="5" fill="#ffffff" stroke="#5b8c5a"/>
+    <text x="105" y="155" text-anchor="middle" font-size="12.5" fill="#333">Left half of</text>
+    <text x="105" y="172" text-anchor="middle" font-size="12.5" fill="#333">every layer</text>
+    <rect x="50" y="215" width="110" height="80" rx="5" fill="#ffffff" stroke="#5b8c5a" stroke-dasharray="4 3"/>
+    <text x="105" y="248" text-anchor="middle" font-size="12.5" fill="#333">Partial</text>
+    <text x="105" y="265" text-anchor="middle" font-size="12.5" fill="#333">results</text>
+
+    <rect x="195" y="85" width="140" height="230" rx="8" fill="#fdf1e7" stroke="#c77b3d" stroke-width="2"/>
+    <text x="265" y="108" text-anchor="middle" font-size="14" font-weight="bold" fill="#8a4d1a">GPU 1</text>
+    <rect x="210" y="122" width="110" height="80" rx="5" fill="#ffffff" stroke="#c77b3d"/>
+    <text x="265" y="155" text-anchor="middle" font-size="12.5" fill="#333">Right half of</text>
+    <text x="265" y="172" text-anchor="middle" font-size="12.5" fill="#333">every layer</text>
+    <rect x="210" y="215" width="110" height="80" rx="5" fill="#ffffff" stroke="#c77b3d" stroke-dasharray="4 3"/>
+    <text x="265" y="248" text-anchor="middle" font-size="12.5" fill="#333">Partial</text>
+    <text x="265" y="265" text-anchor="middle" font-size="12.5" fill="#333">results</text>
+
+    <!-- bidirectional P2P arrows -->
+    <line x1="162" y1="245" x2="208" y2="245" stroke="#c0392b" stroke-width="2.5" marker-end="url(#arrowRed)" marker-start="url(#arrowRed)"/>
+    <text x="185" y="340" text-anchor="middle" font-size="12" fill="#c0392b">PCIe peer-to-peer transfer, every token</text>
+
+    <text x="185" y="378" text-anchor="middle" font-size="12.5" fill="#333">✓ Best aggregate at 8 users (60 tok/s, 32B)</text>
+    <text x="185" y="398" text-anchor="middle" font-size="12.5" fill="#666">Architecture-dependent: aborts on</text>
+    <text x="185" y="416" text-anchor="middle" font-size="12.5" fill="#666">Qwen3.6 under concurrent load</text>
+  </g>
+
+  <text x="600" y="534" text-anchor="middle" font-size="12" fill="#888">vLLM Tensor Parallelism (both GPUs per token via RCCL collectives) is omitted: RCCL does not currently launch on RDNA 4 / gfx1201.</text>
+</svg>
