@@ -309,6 +309,10 @@ MIT — See [LICENSE](LICENSE)
 
 ## Changelog
 
+### v1.6.1 — 2026-07-10
+
+- **Lab cache addressed by DNS** — `DEFAULT_CACHE_HOST` now points at the internal DNS name `lab-cache.puget.systems` (assigned by IT) instead of the bare Spark IP. Resolution is on-network only; off-network the auto-probe silently falls back to direct downloads as before. Override still works via `PUGET_CACHE_HOST` / `--cache-proxy`.
+
 ### v1.6.0 — 2026-07-10
 
 - **Driver ↔ model compatibility gate** — each model's container image carries a minimum NVIDIA driver (cu130 → ≥580, stable → ≥570, defined once in the app-pack's `min_driver_for_image()`). The bench checks the installed driver *before* launching and SKIPs incompatible models with a plain-language fix; `--doctor` reports which image lines the driver supports. Override with `--skip-driver-check`.

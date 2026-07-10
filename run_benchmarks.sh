@@ -29,14 +29,14 @@ NC='\033[0m'
 # Constants
 # ============================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="1.6.0"
+VERSION="1.6.1"
 APP_PACK_REPO="https://github.com/Puget-Systems/puget-docker-app-packs.git"
 APP_PACK_BRANCH="main"
 # Lab cache host (DGX Spark): Olah HF mirror on :8090, Squid HTTP proxy on :3128
-# (puget-hypervisor-devops/terraform). Auto-probed and used when reachable, silently
-# skipped otherwise. Override per-run with --cache-proxy or CACHE_PROXY in bench.conf.
-# TODO: switch to a DNS hostname once IT assigns one.
-DEFAULT_CACHE_HOST="${PUGET_CACHE_HOST:-172.19.168.179}"
+# (puget-hypervisor-devops/terraform). Internal DNS name assigned by IT; resolves to
+# the Spark (currently 172.19.168.179) on-network. Auto-probed and used when reachable,
+# silently skipped otherwise. Override per-run with --cache-proxy or CACHE_PROXY in bench.conf.
+DEFAULT_CACHE_HOST="${PUGET_CACHE_HOST:-lab-cache.puget.systems}"
 # Absolute backstop on the load wait. The real bound is stall-based (vllm_monitor
 # fails after VLLM_STALL_SECONDS of no progress), which correctly distinguishes a
 # slow-but-progressing cold load from a hang. This flat ceiling only catches the rare
